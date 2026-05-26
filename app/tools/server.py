@@ -7,13 +7,14 @@ Run:
     python -m app.tools.server
 """
 import asyncio
+import secrets
 from datetime import date, datetime, timedelta, time
-from typing import Literal
+from typing import Annotated, Literal
 
 import json
 
 import asyncpg
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from loguru import logger
 from pydantic import BaseModel, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -27,6 +28,34 @@ app = FastAPI(title="Voice Agent Tools")
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# ---------------------------------------------------------------------------
+# Auth dependency — shared secret header check on all protected endpoints.
+# ---------------------------------------------------------------------------
+
+async def require_internal_token(
+    x_internal_token: Annotated[str | None, Header()] = None,
+) -> None:
+    """Constant-time comparison against the shared secret.
+
+    Uses secrets.compare_digest to avoid timing side-channels — an attacker
+    measuring response latency gets no signal about how many bytes matched.
+    """
+    if x_internal_token is None:
+        raise HTTPException(status_code=401, detail="Missing X-Internal-Token")
+    if not secrets.compare_digest(x_internal_token, config.TOOLS_INTERNAL_TOKEN):
+        logger.warning(
+            "Tools API auth failure — invalid X-Internal-Token. "
+            "Source IP available in slowapi rate-limit logs."
+        )
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+@app.get("/health")
+async def health():
+    """Unauthenticated — safe for monitoring/load-balancer health checks."""
+    return {"status": "ok"}
 
 # ---------------------------------------------------------------------------
 # Lazy Postgres pool — same pattern as main.py
@@ -124,7 +153,8 @@ class CheckAvailabilityResponse(BaseModel):
     error: str | None = None
 
 
-@app.post("/tools/check_availability", response_model=CheckAvailabilityResponse)
+@app.post("/tools/check_availability", response_model=CheckAvailabilityResponse,
+          dependencies=[Depends(require_internal_token)])
 @limiter.limit("60/minute")
 async def check_availability(request: Request, req: CheckAvailabilityRequest):
     today = date.today()
@@ -202,7 +232,8 @@ class BookAppointmentResponse(BaseModel):
     reason: str | None = None
 
 
-@app.post("/tools/book_appointment", response_model=BookAppointmentResponse)
+@app.post("/tools/book_appointment", response_model=BookAppointmentResponse,
+          dependencies=[Depends(require_internal_token)])
 @limiter.limit("30/minute")
 async def book_appointment(request: Request, req: BookAppointmentRequest):
     slot_dt = datetime.fromisoformat(req.slot)

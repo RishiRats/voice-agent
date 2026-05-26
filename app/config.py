@@ -47,3 +47,10 @@ TOOLS_BASE_URL = os.environ.get("TOOLS_BASE_URL", f"http://{TOOLS_HOST}:{TOOLS_P
 # Cost protection caps.
 MAX_CONCURRENT_CALLS = int(os.environ.get("MAX_CONCURRENT_CALLS", "3"))
 MAX_CALL_DURATION_SECS = int(os.environ.get("MAX_CALL_DURATION_SECS", "600"))
+
+# Shared secret between main.py (caller) and tools/server.py (callee).
+# Required — process exits at startup if missing.
+TOOLS_INTERNAL_TOKEN = _require("TOOLS_INTERNAL_TOKEN")
+
+# Production flag. Set to 'true' to disable the browser /client test page.
+DISABLE_TEST_CLIENT = os.environ.get("DISABLE_TEST_CLIENT", "false").lower() == "true"

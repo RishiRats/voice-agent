@@ -73,6 +73,16 @@ logger.add(sys.stderr, level=config.LOG_LEVEL,
 
 
 # ============================================================================
+# Auth header sent on every outbound request to the tools API.
+# The value is loaded once at startup from config; handlers reference this dict.
+# ============================================================================
+
+_INTERNAL_HEADERS = {
+    "X-Internal-Token": config.TOOLS_INTERNAL_TOKEN,
+}
+
+
+# ============================================================================
 # Cost-protection: concurrent-call limiter.
 # Every active conversation consumes paid API quota (Gemini, Sarvam).
 # This cap means even an attacker with the WSS URL cannot spin up more than
@@ -280,6 +290,7 @@ async def build_pipeline_for_call(
             r = await client.post(
                 f"{config.TOOLS_BASE_URL}/tools/check_availability",
                 json=payload,
+                headers=_INTERNAL_HEADERS,
             )
             result = r.json()
         logger.info(f"[tool] check_availability result={result}")
@@ -312,6 +323,7 @@ async def build_pipeline_for_call(
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(
                 f"{config.TOOLS_BASE_URL}/tools/book_appointment",
+                headers=_INTERNAL_HEADERS,
                 json=payload,
             )
             result = r.json()
