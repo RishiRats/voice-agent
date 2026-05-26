@@ -35,3 +35,7 @@ OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 # Example: GEMINI_MODEL=gemini-3.5-flash
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "")
+
+# FastAPI tools service URL. Pipecat tool handlers call this to check availability
+# and book appointments.
+TOOLS_BASE_URL = os.environ.get("TOOLS_BASE_URL", "http://localhost:8000")
