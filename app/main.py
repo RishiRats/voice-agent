@@ -597,5 +597,17 @@ async def bot(runner_args: RunnerArguments):
 # ============================================================================
 
 if __name__ == "__main__":
+    if config.DISABLE_TEST_CLIENT:
+        # Production mode: the browser test transport must not run.
+        # In Stage 3+ the Exotel WebSocket transport will be wired here instead.
+        # For now, fail loudly so it's obvious what's happening.
+        logger.error(
+            "DISABLE_TEST_CLIENT=true but no production transport is configured yet. "
+            "This will be implemented in Stage 3 when the Exotel WSS transport lands. "
+            "For now, either set DISABLE_TEST_CLIENT=false (dev mode) or wait for Stage 3."
+        )
+        sys.exit(1)
+
+    # Dev mode: start the SmallWebRTC test runner as before.
     from pipecat.runner.run import main
     main()

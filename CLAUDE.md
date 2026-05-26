@@ -133,3 +133,15 @@ After Rishi can talk to Priya in the browser and have a coherent multi-turn conv
 - On `on_client_disconnected`, persist the full transcript to the `call_logs` table
 
 Don't start Stage 2 until Stage 1 is solid. The temptation to add tools before the voice loop is rock-solid will lead to debugging hell.
+
+## Production deployment toggle
+
+`DISABLE_TEST_CLIENT=true` disables the browser-based test runner. This is
+the production setting — public VPS deployments must use this.
+
+Currently (Stage 2), `DISABLE_TEST_CLIENT=true` causes the process to exit
+on startup because no production transport is wired up yet. The Exotel
+WebSocket transport in Stage 3 will fill this in.
+
+In dev, leave `DISABLE_TEST_CLIENT=false` and connect via
+http://localhost:7860/client as before.
