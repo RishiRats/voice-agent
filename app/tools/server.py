@@ -247,5 +247,11 @@ async def book_appointment(req: BookAppointmentRequest):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    from app import config
     import uvicorn
-    uvicorn.run("app.tools.server:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run(
+        "app.tools.server:app",
+        host=config.TOOLS_HOST,
+        port=config.TOOLS_PORT,
+        reload=False,
+    )
