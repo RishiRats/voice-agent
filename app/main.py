@@ -1,9 +1,13 @@
-"""Voice agent entrypoint — Stage 1.
+"""Voice agent entrypoint — Stage 2.
 
 Runs the Pipecat pipeline locally. Connects to your browser via WebRTC:
-    Browser mic ──► Sarvam Saaras (STT) ──► Sarvam-30B (LLM) ──► Sarvam Bulbul (TTS) ──► Browser speakers
+    Browser mic ──► Sarvam Saaras (STT) ──► Gemini (LLM) ──► Sarvam Bulbul (TTS) ──► Browser speakers
 
 To run:
+    # Terminal 1
+    python -m app.tools.server
+
+    # Terminal 2
     python -m app.main
 
 Then open http://localhost:7860/client in your browser, click Connect, and talk.
@@ -11,25 +15,22 @@ Then open http://localhost:7860/client in your browser, click Connect, and talk.
 ARCHITECTURE NOTES
 ==================
 Pipecat is a "pipeline of frame processors". Audio comes in as raw frames from
-the transport (WebRTC in our case), passes through STT → LLM → TTS, and
-goes back out as audio frames. Each processor is async and can run concurrently
-with the others.
+the transport (WebRTC), passes through STT → LLM → TTS, and goes back out as audio.
 
-Sarvam's STT WebSocket has server-side VAD built in — it segments speech
-automatically, so we don't need a local SileroVADAnalyzer in the pipeline.
-
-The LLMContext object holds the conversation history. Pipecat's context aggregator
-automatically appends each user turn (post-STT) and each assistant turn (pre-TTS).
-That gives us per-call short-term memory for free. Redis persistence comes in Stage 2.
-
-Multi-tenancy: when a client connects, we load the tenant's system_prompt from
-Postgres and build the LLMContext with it. Stage 1 uses DEMO_TENANT_ID. Stage 3
-will read the dialed DID from Asterisk SIP headers.
+Stage 2 additions over Stage 1:
+- Tools: Gemini calls check_availability / book_appointment via httpx → FastAPI.
+- Redis: full turn history mirrored to call:{call_id}:messages (written at disconnect).
+- call_logs: one row per call, with transcript, outcome, tool_calls, and async summary.
+- call_id: generated per connection; passed to tool handlers and stored in appointments.
 """
 import asyncio
+import json
 import sys
+import uuid
+from datetime import datetime, timezone
 
 import asyncpg
+import httpx
 from dotenv import load_dotenv
 from loguru import logger
 
@@ -47,6 +48,9 @@ from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.transports.base_transport import TransportParams
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.services.llm_service import FunctionCallParams
 
 from pipecat.services.google.llm import GoogleLLMService
 from pipecat.services.openai.llm import OpenAILLMService
@@ -56,6 +60,7 @@ from pipecat.services.sarvam.tts import SarvamTTSService
 
 from app import config
 from app.services.tenant_loader import load_tenant_by_id, Tenant
+from app.services.redis_memory import append_turns_bulk
 
 load_dotenv()
 
@@ -85,34 +90,82 @@ async def get_pg_pool() -> asyncpg.Pool:
 
 
 # ============================================================================
+# Available tools — all tools the system knows about.
+# Filtered by tenant.tools_enabled before being passed to the LLM.
+# ============================================================================
+
+_ALL_TOOL_SCHEMAS: dict[str, FunctionSchema] = {
+    "check_availability": FunctionSchema(
+        name="check_availability",
+        description=(
+            "Check available appointment slots before booking. "
+            "ALWAYS call this before book_appointment. "
+            "Pass date as YYYY-MM-DD and time_range as one of: morning, afternoon, evening, any."
+        ),
+        properties={
+            "date": {"type": "string", "description": "Date in YYYY-MM-DD format"},
+            "time_range": {
+                "type": "string",
+                "enum": ["morning", "afternoon", "evening", "any"],
+                "description": "Time window to check",
+            },
+        },
+        required=["date", "time_range"],
+    ),
+    "book_appointment": FunctionSchema(
+        name="book_appointment",
+        description=(
+            "Book a confirmed appointment slot. "
+            "NEVER call without: (1) caller chose a specific slot you just offered, "
+            "(2) caller's full name, (3) caller's 10-digit phone number in E.164 (+91XXXXXXXXXX)."
+        ),
+        properties={
+            "slot": {
+                "type": "string",
+                "description": "ISO datetime e.g. 2026-05-28T11:30:00",
+            },
+            "caller_name": {"type": "string", "description": "Full name of the caller"},
+            "caller_phone": {
+                "type": "string",
+                "description": "+91XXXXXXXXXX format",
+            },
+            "notes": {
+                "type": "string",
+                "description": "Optional reason for visit",
+            },
+        },
+        required=["slot", "caller_name", "caller_phone"],
+    ),
+}
+
+
+# ============================================================================
 # Build the per-call pipeline.
 # ============================================================================
 
-async def build_pipeline_for_call(transport, tenant: Tenant) -> tuple[PipelineTask, LLMContext]:
+async def build_pipeline_for_call(
+    transport,
+    tenant: Tenant,
+    call_id: str,
+    tool_call_log: list[dict],
+) -> tuple[PipelineTask, LLMContext]:
     """Construct a Pipecat pipeline customized for this tenant."""
 
-    logger.info(f"Building pipeline for tenant {tenant.id} ({tenant.name!r})")
-    logger.info(f"  Language: {tenant.default_language}  Voice: {tenant.voice}  LLM: {tenant.llm_model}")
+    logger.info(f"Building pipeline for tenant {tenant.id} ({tenant.name!r})  call_id={call_id}")
+    logger.info(f"  Language: {tenant.default_language}  Voice: {tenant.voice}")
 
-    # ----- STT: Sarvam Saaras v3, streaming WebSocket -----
-    # mode='transcribe' keeps output in the source language (Hindi stays Hindi).
-    # The WebSocket connection has server-side VAD built in — no local VAD needed.
-    # Pass language as the raw BCP-47 string; the Language enum serializes to
-    # a short code ('hi') that the Sarvam API doesn't accept.
+    # ----- STT -----
     stt = SarvamSTTService(
         api_key=config.SARVAM_API_KEY,
         mode="transcribe",
         sample_rate=16000,
         settings=SarvamSTTService.Settings(
             model="saaras:v3",
-            language=tenant.default_language,  # e.g. "hi-IN" — must be string, not Language enum
+            language=tenant.default_language,
         ),
     )
 
-    # ----- LLM: priority order — Gemini > Ollama > Sarvam -----
-    # Set GEMINI_MODEL + GOOGLE_API_KEY to use Gemini Flash (best quality, free tier).
-    # Set OLLAMA_MODEL to use a local Ollama model (offline fallback).
-    # Leave both unset to use Sarvam-30B (production default).
+    # ----- LLM: Gemini > Ollama > Sarvam -----
     if config.GEMINI_MODEL and config.GOOGLE_API_KEY:
         logger.info(f"  Using Gemini LLM: {config.GEMINI_MODEL}")
         llm = GoogleLLMService(
@@ -124,7 +177,7 @@ async def build_pipeline_for_call(transport, tenant: Tenant) -> tuple[PipelineTa
             ),
         )
     elif config.OLLAMA_MODEL:
-        logger.info(f"  Using Ollama LLM: {config.OLLAMA_MODEL} at {config.OLLAMA_BASE_URL}")
+        logger.info(f"  Using Ollama LLM: {config.OLLAMA_MODEL}")
         llm = OpenAILLMService(
             api_key="ollama",
             base_url=config.OLLAMA_BASE_URL,
@@ -145,50 +198,92 @@ async def build_pipeline_for_call(transport, tenant: Tenant) -> tuple[PipelineTa
             ),
         )
 
-    # ----- TTS: Sarvam Bulbul v3, WebSocket streaming -----
-    # voice must be a bulbul:v3 speaker name (lowercase). bulbul:v2 names like
-    # 'anushka' are NOT valid for v3 and will silently use the model default.
-    # See seed.sql for the configured voice; default is 'priya'.
-    # sample_rate=16000: standard voice call quality; matches STT input rate.
-    # Stage 3 (Asterisk/PSTN): switch to sample_rate=8000 + mulaw codec.
+    # ----- TTS -----
     tts = SarvamTTSService(
         api_key=config.SARVAM_API_KEY,
         sample_rate=16000,
         settings=SarvamTTSService.Settings(
             model="bulbul:v3",
             voice=tenant.voice,
-            language=tenant.default_language,  # string, not Language enum
-            temperature=0.6,  # balanced: natural yet reliable (per Sarvam docs)
-            pace=1.0,         # natural speed for conversational agent
+            language=tenant.default_language,
+            temperature=0.6,
+            pace=1.0,
         ),
     )
 
-    # ----- Conversation context -----
-    initial_messages = [
-        {"role": "system", "content": tenant.system_prompt},
+    # ----- Tools -----
+    enabled_schemas = [
+        _ALL_TOOL_SCHEMAS[name]
+        for name in tenant.tools_enabled
+        if name in _ALL_TOOL_SCHEMAS
     ]
-    context = LLMContext(initial_messages)
+    tools_schema = ToolsSchema(standard_tools=enabled_schemas)
+    logger.info(f"  Tools enabled: {[s._name for s in enabled_schemas]}")
+
+    # Tool handlers — closures that capture call_id, tenant, tool_call_log.
+    async def handle_check_availability(params: FunctionCallParams) -> None:
+        logger.info(f"[tool] check_availability args={params.arguments}")
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(
+                f"{config.TOOLS_BASE_URL}/tools/check_availability",
+                json={"tenant_id": tenant.id, **params.arguments},
+            )
+            result = r.json()
+        logger.info(f"[tool] check_availability result={result}")
+        tool_call_log.append({
+            "name": "check_availability",
+            "args": dict(params.arguments),
+            "result": result,
+            "at": datetime.now(timezone.utc).isoformat(),
+        })
+        await params.result_callback(result)
+
+    async def handle_book_appointment(params: FunctionCallParams) -> None:
+        logger.info(f"[tool] book_appointment args={params.arguments}")
+        payload = {"tenant_id": tenant.id, "call_id": call_id, **params.arguments}
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(
+                f"{config.TOOLS_BASE_URL}/tools/book_appointment",
+                json=payload,
+            )
+            result = r.json()
+        logger.info(f"[tool] book_appointment result={result}")
+        tool_call_log.append({
+            "name": "book_appointment",
+            "args": payload,
+            "result": result,
+            "at": datetime.now(timezone.utc).isoformat(),
+        })
+        await params.result_callback(result)
+
+    if "check_availability" in tenant.tools_enabled:
+        llm.register_function("check_availability", handle_check_availability)
+    if "book_appointment" in tenant.tools_enabled:
+        llm.register_function("book_appointment", handle_book_appointment)
+
+    # ----- Conversation context -----
+    context = LLMContext(
+        messages=[{"role": "system", "content": tenant.system_prompt}],
+        tools=tools_schema,
+    )
+
     # vad_analyzer enables fast barge-in: VADUserTurnStartStrategy fires after
     # start_secs=0.1 (100ms) of detected speech, interrupting Priya immediately.
-    # Without this, the default falls through to TranscriptionUserTurnStartStrategy
-    # which only fires when Sarvam STT returns text (end-of-speech → too late).
     context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
-                    start_secs=0.1,   # interrupt after 100ms of detected speech
-                    stop_secs=0.4,    # confirm speech end after 400ms silence
-                    confidence=0.6,   # moderate threshold — not too sensitive to noise
-                    min_volume=0.4,   # ignore low-level background noise
+                    start_secs=0.1,
+                    stop_secs=0.4,
+                    confidence=0.6,
+                    min_volume=0.4,
                 )
             )
         ),
     )
 
     # ----- Pipeline -----
-    # Frame flow: mic audio → STT (with server-side VAD) → user turn appended →
-    # LLM generates → TTS speaks → audio out → assistant turn appended.
     pipeline = Pipeline([
         transport.input(),
         stt,
@@ -212,6 +307,43 @@ async def build_pipeline_for_call(transport, tenant: Tenant) -> tuple[PipelineTa
 
 
 # ============================================================================
+# Async post-call summary (fire-and-forget — does not block disconnect).
+# ============================================================================
+
+async def _generate_and_store_summary(pool: asyncpg.Pool, call_id: str, messages: list[dict]) -> None:
+    """Generate a one-line call summary with Gemini and UPDATE call_logs."""
+    if not (config.GEMINI_MODEL and config.GOOGLE_API_KEY):
+        return
+    try:
+        import google.genai as genai
+        client = genai.Client(api_key=config.GOOGLE_API_KEY)
+        transcript_text = "\n".join(
+            f"{m.get('role', '?').upper()}: {m.get('content', '')}"
+            for m in messages
+            if m.get("role") in ("user", "assistant") and m.get("content")
+        )
+        prompt = (
+            "Summarize this dental clinic phone call in one short English sentence "
+            "(max 20 words). Focus on outcome — did they book, just ask questions, etc.\n\n"
+            f"{transcript_text}"
+        )
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=config.GEMINI_MODEL,
+            contents=prompt,
+        )
+        summary = response.text.strip()
+        await pool.execute(
+            "UPDATE call_logs SET summary = $1 WHERE call_id = $2",
+            summary,
+            call_id,
+        )
+        logger.info(f"Summary stored for call {call_id}: {summary!r}")
+    except Exception as e:
+        logger.warning(f"Summary generation failed for call {call_id}: {e}")
+
+
+# ============================================================================
 # Per-call entry point — called by Pipecat's runner when a client connects.
 # ============================================================================
 
@@ -220,6 +352,10 @@ async def bot(runner_args: RunnerArguments):
 
     pool = await get_pg_pool()
     tenant = await load_tenant_by_id(pool, config.DEMO_TENANT_ID)
+
+    call_id = str(uuid.uuid4())
+    tool_call_log: list[dict] = []
+    started_at: datetime | None = None
 
     transport = await create_transport(
         runner_args,
@@ -231,19 +367,75 @@ async def bot(runner_args: RunnerArguments):
         },
     )
 
-    task, context = await build_pipeline_for_call(transport, tenant)
+    task, context = await build_pipeline_for_call(transport, tenant, call_id, tool_call_log)
 
     @transport.event_handler("on_client_connected")
     async def on_connected(transport, client):
-        logger.info(f"Client connected. Greeting: {tenant.greeting!r}")
+        nonlocal started_at
+        started_at = datetime.now(timezone.utc)
+        logger.info(f"Client connected. call_id={call_id}  greeting={tenant.greeting!r}")
+
+        # Create the call_log row now so appointments can FK-reference call_id during the call.
+        await pool.execute(
+            """
+            INSERT INTO call_logs (tenant_id, call_id, started_at, tool_calls, metadata)
+            VALUES ($1, $2, $3, '[]'::jsonb, '{}'::jsonb)
+            ON CONFLICT (call_id) DO NOTHING
+            """,
+            tenant.id,
+            call_id,
+            started_at,
+        )
+
         context.messages.append({"role": "assistant", "content": tenant.greeting})
         await task.queue_frame(TTSSpeakFrame(tenant.greeting))
 
     @transport.event_handler("on_client_disconnected")
     async def on_disconnected(transport, client):
-        logger.info("Client disconnected.")
-        for msg in context.messages:
-            logger.debug(f"  [{msg.get('role')}] {msg.get('content')!r}")
+        ended_at = datetime.now(timezone.utc)
+        duration_secs = int((ended_at - started_at).total_seconds()) if started_at else 0
+        logger.info(f"Client disconnected. call_id={call_id}  duration={duration_secs}s")
+
+        # Determine call outcome from tool_call_log
+        booked = any(
+            t["name"] == "book_appointment" and t.get("result", {}).get("success")
+            for t in tool_call_log
+        )
+        turn_count = sum(1 for m in context.messages if m.get("role") in ("user", "assistant"))
+        if booked:
+            outcome = "appointment_booked"
+        elif turn_count < 4:
+            outcome = "abandoned"
+        else:
+            outcome = "lead_captured"
+
+        logger.info(f"  outcome={outcome}  turns={turn_count}  tool_calls={len(tool_call_log)}")
+
+        # Mirror full turn history to Redis (simple: write once at end of call)
+        await append_turns_bulk(call_id, context.messages)
+
+        # Persist transcript + outcome to call_logs
+        await pool.execute(
+            """
+            UPDATE call_logs SET
+                ended_at      = $1,
+                duration_secs = $2,
+                transcript    = $3::jsonb,
+                outcome       = $4,
+                tool_calls    = $5::jsonb
+            WHERE call_id = $6
+            """,
+            ended_at,
+            duration_secs,
+            json.dumps(context.messages),
+            outcome,
+            json.dumps(tool_call_log),
+            call_id,
+        )
+
+        # Async summary — don't block disconnect
+        asyncio.create_task(_generate_and_store_summary(pool, call_id, context.messages))
+
         await task.cancel()
 
     runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
