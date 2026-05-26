@@ -396,12 +396,17 @@ async def bot(runner_args: RunnerArguments):
         duration_secs = int((ended_at - started_at).total_seconds()) if started_at else 0
         logger.info(f"Client disconnected. call_id={call_id}  duration={duration_secs}s")
 
+        # context.messages is a mix of plain dicts (user/assistant text) and
+        # LLMSpecificMessage objects (tool calls, function responses). Only plain
+        # dicts are serializable and relevant for the transcript.
+        plain_messages = [m for m in context.messages if isinstance(m, dict)]
+
         # Determine call outcome from tool_call_log
         booked = any(
             t["name"] == "book_appointment" and t.get("result", {}).get("success")
             for t in tool_call_log
         )
-        turn_count = sum(1 for m in context.messages if m.get("role") in ("user", "assistant"))
+        turn_count = sum(1 for m in plain_messages if m.get("role") in ("user", "assistant"))
         if booked:
             outcome = "appointment_booked"
         elif turn_count < 4:
@@ -412,7 +417,7 @@ async def bot(runner_args: RunnerArguments):
         logger.info(f"  outcome={outcome}  turns={turn_count}  tool_calls={len(tool_call_log)}")
 
         # Mirror full turn history to Redis (simple: write once at end of call)
-        await append_turns_bulk(call_id, context.messages)
+        await append_turns_bulk(call_id, plain_messages)
 
         # Persist transcript + outcome to call_logs
         await pool.execute(
@@ -427,14 +432,14 @@ async def bot(runner_args: RunnerArguments):
             """,
             ended_at,
             duration_secs,
-            json.dumps(context.messages),
+            json.dumps(plain_messages),
             outcome,
             json.dumps(tool_call_log),
             call_id,
         )
 
         # Async summary — don't block disconnect
-        asyncio.create_task(_generate_and_store_summary(pool, call_id, context.messages))
+        asyncio.create_task(_generate_and_store_summary(pool, call_id, plain_messages))
 
         await task.cancel()
 

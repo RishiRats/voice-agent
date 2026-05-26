@@ -37,7 +37,9 @@
       "Bash(grep -v \"^$\")",
       "Bash(git init *)",
       "Bash(git add *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(pkill -f \"app.tools.server\")",
+      "Bash(fuser -k 8000/tcp)"
     ]
   }
 }
