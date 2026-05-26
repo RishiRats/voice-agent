@@ -39,7 +39,8 @@
       "Bash(git add *)",
       "Bash(git commit *)",
       "Bash(pkill -f \"app.tools.server\")",
-      "Bash(fuser -k 8000/tcp)"
+      "Bash(fuser -k 8000/tcp)",
+      "Bash(python3 *)"
     ]
   }
 }

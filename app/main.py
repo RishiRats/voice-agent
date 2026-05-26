@@ -38,6 +38,8 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+from pipecat.frames.frames import Frame, TextFrame
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.processors.aggregators.llm_response_universal import (
@@ -52,7 +54,7 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.llm_service import FunctionCallParams
 
-from pipecat.services.google.llm import GoogleLLMService, GoogleThinkingConfig
+from pipecat.services.google.llm import GoogleLLMService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.sarvam.llm import SarvamLLMService
 from pipecat.services.sarvam.stt import SarvamSTTService
@@ -87,6 +89,33 @@ async def get_pg_pool() -> asyncpg.Pool:
             command_timeout=10,
         )
     return _pg_pool
+
+
+# ============================================================================
+# HindiTTSGuard — ensures every text chunk sent to Sarvam TTS contains at
+# least one Devanagari character. Sarvam Bulbul (language=hi-IN) rejects
+# pure-English chunks with a 400 error. A Mumbai receptionist naturally
+# prefixes most English sentences with "जी," anyway, so this is unobtrusive.
+# ============================================================================
+
+_DEVANAGARI_RANGE = range(0x0900, 0x0980)
+
+
+def _has_devanagari(text: str) -> bool:
+    return any(ord(c) in _DEVANAGARI_RANGE for c in text)
+
+
+class HindiTTSGuard(FrameProcessor):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if (
+            isinstance(frame, TextFrame)
+            and direction == FrameDirection.DOWNSTREAM
+            and frame.text.strip()
+            and not _has_devanagari(frame.text)
+        ):
+            frame = TextFrame(text="जी, " + frame.text)
+        await self.push_frame(frame, direction)
 
 
 # ============================================================================
@@ -174,7 +203,6 @@ async def build_pipeline_for_call(
                 model=config.GEMINI_MODEL,
                 temperature=tenant.temperature,
                 max_tokens=512,
-                thinking=GoogleThinkingConfig(thinking_level="minimal"),
             ),
         )
     elif config.OLLAMA_MODEL:
@@ -263,8 +291,12 @@ async def build_pipeline_for_call(
         llm.register_function("book_appointment", handle_book_appointment)
 
     # ----- Conversation context -----
+    # Inject today's date so the LLM can correctly resolve relative terms
+    # like "kal" (tomorrow), "parsho" (day after tomorrow), "next Tuesday", etc.
+    today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")  # e.g. "Tuesday, 26 May 2026"
+    system_with_date = tenant.system_prompt + f"\n\nToday is {today} (IST)."
     context = LLMContext(
-        messages=[{"role": "system", "content": tenant.system_prompt}],
+        messages=[{"role": "system", "content": system_with_date}],
         tools=tools_schema,
     )
 
@@ -290,6 +322,7 @@ async def build_pipeline_for_call(
         stt,
         context_aggregator.user(),
         llm,
+        HindiTTSGuard(),  # prepends "जी, " to pure-English chunks so Sarvam TTS accepts them
         tts,
         transport.output(),
         context_aggregator.assistant(),
