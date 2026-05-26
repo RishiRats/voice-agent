@@ -369,6 +369,12 @@ async def bot(runner_args: RunnerArguments):
 
     task, context = await build_pipeline_for_call(transport, tenant, call_id, tool_call_log)
 
+    # Filler phrase while tool is executing — fires the moment Gemini emits a tool call,
+    # before the HTTP round-trip to the tools server completes.
+    @task.event_handler("on_function_calls_started")
+    async def on_tool_started(service, function_calls):
+        await task.queue_frame(TTSSpeakFrame("जी, एक second..."))
+
     @transport.event_handler("on_client_connected")
     async def on_connected(transport, client):
         nonlocal started_at
