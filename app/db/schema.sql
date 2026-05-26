@@ -77,6 +77,12 @@ CREATE TABLE IF NOT EXISTS appointments (
 
 CREATE INDEX IF NOT EXISTS idx_appointments_tenant_slot ON appointments(tenant_id, slot_at);
 
+-- Partial unique index: at most one 'booked' appointment per (tenant, slot).
+-- Cancelled/completed rows are excluded so the slot can be re-booked after cancellation.
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_appointments_active_slot
+    ON appointments (tenant_id, slot_at)
+    WHERE status = 'booked';
+
 
 -- =============================================================================
 -- TRIGGER: keep tenants.updated_at fresh

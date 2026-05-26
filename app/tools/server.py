@@ -199,31 +199,36 @@ async def book_appointment(req: BookAppointmentRequest):
     slot_dt = datetime.fromisoformat(req.slot)
     pool = await get_pg_pool()
 
-    # Race guard — check slot isn't already taken
-    conflict = await pool.fetchval(
-        """
-        SELECT 1 FROM appointments
-        WHERE tenant_id = $1 AND slot_at = $2 AND status = 'booked'
-        """,
-        req.tenant_id,
-        slot_dt,
-    )
-    if conflict:
-        return BookAppointmentResponse(success=False, reason="slot_taken")
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                existing = await conn.fetchval(
+                    """
+                    SELECT id FROM appointments
+                    WHERE tenant_id = $1 AND slot_at = $2 AND status = 'booked'
+                    FOR UPDATE
+                    """,
+                    req.tenant_id,
+                    slot_dt,
+                )
+                if existing is not None:
+                    return BookAppointmentResponse(success=False, reason="slot_taken")
 
-    row = await pool.fetchrow(
-        """
-        INSERT INTO appointments (tenant_id, call_id, caller_name, caller_phone, slot_at, notes, status)
-        VALUES ($1, $2, $3, $4, $5, $6, 'booked')
-        RETURNING id, slot_at
-        """,
-        req.tenant_id,
-        req.call_id,
-        req.caller_name,
-        req.caller_phone,
-        slot_dt,
-        req.notes,
-    )
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO appointments (tenant_id, call_id, caller_name, caller_phone, slot_at, notes, status)
+                    VALUES ($1, $2, $3, $4, $5, $6, 'booked')
+                    RETURNING id, slot_at
+                    """,
+                    req.tenant_id,
+                    req.call_id,
+                    req.caller_name,
+                    req.caller_phone,
+                    slot_dt,
+                    req.notes,
+                )
+    except asyncpg.exceptions.UniqueViolationError:
+        return BookAppointmentResponse(success=False, reason="slot_taken")
 
     logger.info(
         f"BOOKED: id={row['id']} tenant={req.tenant_id} "

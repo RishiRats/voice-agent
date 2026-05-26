@@ -251,25 +251,53 @@ async def build_pipeline_for_call(
 
     # Tool handlers — closures that capture call_id, tenant, tool_call_log.
     async def handle_check_availability(params: FunctionCallParams) -> None:
-        logger.info(f"[tool] check_availability args={params.arguments}")
+        if "tenant_id" in params.arguments or "call_id" in params.arguments:
+            logger.warning(
+                f"Suspicious tool call: LLM included server-controlled fields. "
+                f"tool=check_availability arguments={dict(params.arguments)} call_id={call_id}"
+            )
+        args = dict(params.arguments)
+        args.pop("tenant_id", None)
+        args.pop("call_id", None)
+        payload = {
+            "tenant_id": tenant.id,
+            "date": args.get("date"),
+            "time_range": args.get("time_range"),
+        }
+        logger.info(f"[tool] check_availability args={args}")
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(
                 f"{config.TOOLS_BASE_URL}/tools/check_availability",
-                json={"tenant_id": tenant.id, **params.arguments},
+                json=payload,
             )
             result = r.json()
         logger.info(f"[tool] check_availability result={result}")
         tool_call_log.append({
             "name": "check_availability",
-            "args": dict(params.arguments),
+            "args": args,
             "result": result,
             "at": datetime.now(timezone.utc).isoformat(),
         })
         await params.result_callback(result)
 
     async def handle_book_appointment(params: FunctionCallParams) -> None:
-        logger.info(f"[tool] book_appointment args={params.arguments}")
-        payload = {"tenant_id": tenant.id, "call_id": call_id, **params.arguments}
+        if "tenant_id" in params.arguments or "call_id" in params.arguments:
+            logger.warning(
+                f"Suspicious tool call: LLM included server-controlled fields. "
+                f"tool=book_appointment arguments={dict(params.arguments)} call_id={call_id}"
+            )
+        args = dict(params.arguments)
+        args.pop("tenant_id", None)
+        args.pop("call_id", None)
+        payload = {
+            "tenant_id": tenant.id,
+            "call_id": call_id,
+            "slot": args.get("slot"),
+            "caller_name": args.get("caller_name"),
+            "caller_phone": args.get("caller_phone"),
+            "notes": args.get("notes"),
+        }
+        logger.info(f"[tool] book_appointment args={args}")
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(
                 f"{config.TOOLS_BASE_URL}/tools/book_appointment",
@@ -279,7 +307,7 @@ async def build_pipeline_for_call(
         logger.info(f"[tool] book_appointment result={result}")
         tool_call_log.append({
             "name": "book_appointment",
-            "args": payload,
+            "args": args,
             "result": result,
             "at": datetime.now(timezone.utc).isoformat(),
         })
