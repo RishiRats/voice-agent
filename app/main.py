@@ -52,7 +52,7 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.llm_service import FunctionCallParams
 
-from pipecat.services.google.llm import GoogleLLMService
+from pipecat.services.google.llm import GoogleLLMService, GoogleThinkingConfig
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.sarvam.llm import SarvamLLMService
 from pipecat.services.sarvam.stt import SarvamSTTService
@@ -174,6 +174,7 @@ async def build_pipeline_for_call(
                 model=config.GEMINI_MODEL,
                 temperature=tenant.temperature,
                 max_tokens=512,
+                thinking=GoogleThinkingConfig(thinking_level="minimal"),
             ),
         )
     elif config.OLLAMA_MODEL:
