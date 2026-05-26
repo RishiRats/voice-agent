@@ -39,7 +39,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
-from pipecat.frames.frames import Frame, TextFrame
+from pipecat.frames.frames import EndFrame, Frame, TextFrame
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.processors.aggregators.llm_response_universal import (
@@ -70,6 +70,17 @@ load_dotenv()
 logger.remove()
 logger.add(sys.stderr, level=config.LOG_LEVEL,
            format="<green>{time:HH:mm:ss.SSS}</green> | <level>{level:<8}</level> | {message}")
+
+
+# ============================================================================
+# Cost-protection: concurrent-call limiter.
+# Every active conversation consumes paid API quota (Gemini, Sarvam).
+# This cap means even an attacker with the WSS URL cannot spin up more than
+# MAX_CONCURRENT_CALLS simultaneous pipelines.
+# ============================================================================
+
+_concurrency_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_CALLS)
+_active_calls = 0  # for logging/observability only
 
 
 # ============================================================================
@@ -406,113 +417,167 @@ async def _generate_and_store_summary(pool: asyncpg.Pool, call_id: str, messages
 
 
 # ============================================================================
+# Per-call watchdog — forces pipeline termination after MAX_CALL_DURATION_SECS.
+# ============================================================================
+
+async def _force_terminate_after_timeout(task: PipelineTask, call_id: str, duration: int) -> None:
+    """Force-end a call that exceeds the maximum allowed duration."""
+    try:
+        await asyncio.sleep(duration)
+        logger.warning(
+            f"TIMEOUT: call {call_id} exceeded {duration}s — forcing termination. "
+            f"Possible attack or stuck pipeline."
+        )
+        try:
+            await task.queue_frame(TTSSpeakFrame(
+                "I need to end the call now. Please call back if you need further help. Goodbye."
+            ))
+            await asyncio.sleep(3)
+        except Exception:
+            pass
+        await task.queue_frame(EndFrame())
+    except asyncio.CancelledError:
+        pass  # Normal disconnect cancelled this watchdog — exit quietly.
+
+
+# ============================================================================
 # Per-call entry point — called by Pipecat's runner when a client connects.
 # ============================================================================
 
 async def bot(runner_args: RunnerArguments):
     """Entrypoint: called once per WebRTC connection (or per phone call in Stage 3)."""
+    global _active_calls
 
-    pool = await get_pg_pool()
-    tenant = await load_tenant_by_id(pool, config.DEMO_TENANT_ID)
+    # ---- Concurrency gate (cost protection) ----
+    # In asyncio there's no await between the check and the acquire, so this is
+    # race-free — another coroutine can only preempt at an 'await' point.
+    if _concurrency_semaphore._value <= 0:
+        logger.warning(
+            f"REJECTED: connection refused, {_active_calls} calls already active "
+            f"(max {config.MAX_CONCURRENT_CALLS}). Possible attack or load spike."
+        )
+        return
+    await _concurrency_semaphore.acquire()
 
-    call_id = str(uuid.uuid4())
-    tool_call_log: list[dict] = []
-    started_at: datetime | None = None
+    _active_calls += 1
+    logger.info(f"Call accepted. Active: {_active_calls}/{config.MAX_CONCURRENT_CALLS}")
 
-    transport = await create_transport(
-        runner_args,
-        transport_params={
-            "webrtc": lambda: TransportParams(
-                audio_in_enabled=True,
-                audio_out_enabled=True,
+    try:
+        pool = await get_pg_pool()
+        tenant = await load_tenant_by_id(pool, config.DEMO_TENANT_ID)
+
+        call_id = str(uuid.uuid4())
+        tool_call_log: list[dict] = []
+        started_at: datetime | None = None
+
+        transport = await create_transport(
+            runner_args,
+            transport_params={
+                "webrtc": lambda: TransportParams(
+                    audio_in_enabled=True,
+                    audio_out_enabled=True,
+                )
+            },
+        )
+
+        task, context = await build_pipeline_for_call(transport, tenant, call_id, tool_call_log)
+
+        # Filler phrase while tool is executing — fires the moment Gemini emits a tool call,
+        # before the HTTP round-trip to the tools server completes.
+        @task.event_handler("on_function_calls_started")
+        async def on_tool_started(service, function_calls):
+            await task.queue_frame(TTSSpeakFrame("जी, एक second..."))
+
+        # ---- Per-call timeout watchdog (cost protection) ----
+        timeout_task = asyncio.create_task(
+            _force_terminate_after_timeout(task, call_id, config.MAX_CALL_DURATION_SECS)
+        )
+
+        @transport.event_handler("on_client_connected")
+        async def on_connected(transport, client):
+            nonlocal started_at
+            started_at = datetime.now(timezone.utc)
+            logger.info(f"Client connected. call_id={call_id}  greeting={tenant.greeting!r}")
+
+            # Create the call_log row now so appointments can FK-reference call_id during the call.
+            await pool.execute(
+                """
+                INSERT INTO call_logs (tenant_id, call_id, started_at, tool_calls, metadata)
+                VALUES ($1, $2, $3, '[]'::jsonb, '{}'::jsonb)
+                ON CONFLICT (call_id) DO NOTHING
+                """,
+                tenant.id,
+                call_id,
+                started_at,
             )
-        },
-    )
 
-    task, context = await build_pipeline_for_call(transport, tenant, call_id, tool_call_log)
+            context.messages.append({"role": "assistant", "content": tenant.greeting})
+            await task.queue_frame(TTSSpeakFrame(tenant.greeting))
 
-    # Filler phrase while tool is executing — fires the moment Gemini emits a tool call,
-    # before the HTTP round-trip to the tools server completes.
-    @task.event_handler("on_function_calls_started")
-    async def on_tool_started(service, function_calls):
-        await task.queue_frame(TTSSpeakFrame("जी, एक second..."))
+        @transport.event_handler("on_client_disconnected")
+        async def on_disconnected(transport, client):
+            # Cancel the watchdog on normal disconnect so it doesn't fire after hangup.
+            if not timeout_task.done():
+                timeout_task.cancel()
 
-    @transport.event_handler("on_client_connected")
-    async def on_connected(transport, client):
-        nonlocal started_at
-        started_at = datetime.now(timezone.utc)
-        logger.info(f"Client connected. call_id={call_id}  greeting={tenant.greeting!r}")
+            ended_at = datetime.now(timezone.utc)
+            duration_secs = int((ended_at - started_at).total_seconds()) if started_at else 0
+            logger.info(f"Client disconnected. call_id={call_id}  duration={duration_secs}s")
 
-        # Create the call_log row now so appointments can FK-reference call_id during the call.
-        await pool.execute(
-            """
-            INSERT INTO call_logs (tenant_id, call_id, started_at, tool_calls, metadata)
-            VALUES ($1, $2, $3, '[]'::jsonb, '{}'::jsonb)
-            ON CONFLICT (call_id) DO NOTHING
-            """,
-            tenant.id,
-            call_id,
-            started_at,
-        )
+            # context.messages is a mix of plain dicts (user/assistant text) and
+            # LLMSpecificMessage objects (tool calls, function responses). Only plain
+            # dicts are serializable and relevant for the transcript.
+            plain_messages = [m for m in context.messages if isinstance(m, dict)]
 
-        context.messages.append({"role": "assistant", "content": tenant.greeting})
-        await task.queue_frame(TTSSpeakFrame(tenant.greeting))
+            # Determine call outcome from tool_call_log
+            booked = any(
+                t["name"] == "book_appointment" and t.get("result", {}).get("success")
+                for t in tool_call_log
+            )
+            turn_count = sum(1 for m in plain_messages if m.get("role") in ("user", "assistant"))
+            if booked:
+                outcome = "appointment_booked"
+            elif turn_count < 4:
+                outcome = "abandoned"
+            else:
+                outcome = "lead_captured"
 
-    @transport.event_handler("on_client_disconnected")
-    async def on_disconnected(transport, client):
-        ended_at = datetime.now(timezone.utc)
-        duration_secs = int((ended_at - started_at).total_seconds()) if started_at else 0
-        logger.info(f"Client disconnected. call_id={call_id}  duration={duration_secs}s")
+            logger.info(f"  outcome={outcome}  turns={turn_count}  tool_calls={len(tool_call_log)}")
 
-        # context.messages is a mix of plain dicts (user/assistant text) and
-        # LLMSpecificMessage objects (tool calls, function responses). Only plain
-        # dicts are serializable and relevant for the transcript.
-        plain_messages = [m for m in context.messages if isinstance(m, dict)]
+            # Mirror full turn history to Redis (simple: write once at end of call)
+            await append_turns_bulk(call_id, plain_messages)
 
-        # Determine call outcome from tool_call_log
-        booked = any(
-            t["name"] == "book_appointment" and t.get("result", {}).get("success")
-            for t in tool_call_log
-        )
-        turn_count = sum(1 for m in plain_messages if m.get("role") in ("user", "assistant"))
-        if booked:
-            outcome = "appointment_booked"
-        elif turn_count < 4:
-            outcome = "abandoned"
-        else:
-            outcome = "lead_captured"
+            # Persist transcript + outcome to call_logs
+            await pool.execute(
+                """
+                UPDATE call_logs SET
+                    ended_at      = $1,
+                    duration_secs = $2,
+                    transcript    = $3::jsonb,
+                    outcome       = $4,
+                    tool_calls    = $5::jsonb
+                WHERE call_id = $6
+                """,
+                ended_at,
+                duration_secs,
+                json.dumps(plain_messages),
+                outcome,
+                json.dumps(tool_call_log),
+                call_id,
+            )
 
-        logger.info(f"  outcome={outcome}  turns={turn_count}  tool_calls={len(tool_call_log)}")
+            # Async summary — don't block disconnect
+            asyncio.create_task(_generate_and_store_summary(pool, call_id, plain_messages))
 
-        # Mirror full turn history to Redis (simple: write once at end of call)
-        await append_turns_bulk(call_id, plain_messages)
+            await task.cancel()
 
-        # Persist transcript + outcome to call_logs
-        await pool.execute(
-            """
-            UPDATE call_logs SET
-                ended_at      = $1,
-                duration_secs = $2,
-                transcript    = $3::jsonb,
-                outcome       = $4,
-                tool_calls    = $5::jsonb
-            WHERE call_id = $6
-            """,
-            ended_at,
-            duration_secs,
-            json.dumps(plain_messages),
-            outcome,
-            json.dumps(tool_call_log),
-            call_id,
-        )
+        runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+        await runner.run(task)
 
-        # Async summary — don't block disconnect
-        asyncio.create_task(_generate_and_store_summary(pool, call_id, plain_messages))
-
-        await task.cancel()
-
-    runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
-    await runner.run(task)
+    finally:
+        _concurrency_semaphore.release()
+        _active_calls -= 1
+        logger.info(f"Call ended. Active: {_active_calls}/{config.MAX_CONCURRENT_CALLS}")
 
 
 # ============================================================================

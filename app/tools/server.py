@@ -13,13 +13,20 @@ from typing import Literal
 import json
 
 import asyncpg
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from loguru import logger
 from pydantic import BaseModel, field_validator
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from app import config
 
 app = FastAPI(title="Voice Agent Tools")
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ---------------------------------------------------------------------------
 # Lazy Postgres pool — same pattern as main.py
@@ -118,7 +125,8 @@ class CheckAvailabilityResponse(BaseModel):
 
 
 @app.post("/tools/check_availability", response_model=CheckAvailabilityResponse)
-async def check_availability(req: CheckAvailabilityRequest):
+@limiter.limit("60/minute")
+async def check_availability(request: Request, req: CheckAvailabilityRequest):
     today = date.today()
     requested = datetime.strptime(req.date, "%Y-%m-%d").date()
 
@@ -195,7 +203,8 @@ class BookAppointmentResponse(BaseModel):
 
 
 @app.post("/tools/book_appointment", response_model=BookAppointmentResponse)
-async def book_appointment(req: BookAppointmentRequest):
+@limiter.limit("30/minute")
+async def book_appointment(request: Request, req: BookAppointmentRequest):
     slot_dt = datetime.fromisoformat(req.slot)
     pool = await get_pg_pool()
 

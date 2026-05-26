@@ -43,3 +43,7 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "")
 TOOLS_HOST = os.environ.get("TOOLS_HOST", "127.0.0.1")
 TOOLS_PORT = int(os.environ.get("TOOLS_PORT", "8000"))
 TOOLS_BASE_URL = os.environ.get("TOOLS_BASE_URL", f"http://{TOOLS_HOST}:{TOOLS_PORT}")
+
+# Cost protection caps.
+MAX_CONCURRENT_CALLS = int(os.environ.get("MAX_CONCURRENT_CALLS", "3"))
+MAX_CALL_DURATION_SECS = int(os.environ.get("MAX_CALL_DURATION_SECS", "600"))
