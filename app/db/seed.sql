@@ -103,7 +103,7 @@ yet — tell callers you'll have someone confirm the booking and call them back.
     'hi-IN',
     'sarvam-30b',
     0.4,
-    '["check_availability", "book_appointment", "handoff_to_human"]'::jsonb,
+    '["check_availability", "book_appointment"]'::jsonb,
     '{"mon-sat": "10:00-20:00", "sun": "closed"}'::jsonb,
     '{
         "address": "Shop 3, Lokhandwala Complex, Andheri West, Mumbai 400053",
