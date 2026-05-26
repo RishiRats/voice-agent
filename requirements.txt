@@ -1,0 +1,15 @@
+# Pipecat with the extras we need.
+# - sarvam: STT, TTS, LLM service classes
+# - webrtc: SmallWebRTCTransport (browser mic in Stage 1)
+# - silero: VAD (voice activity detection — knows when caller has finished talking)
+pipecat-ai[sarvam,webrtc,silero]>=0.0.108
+
+# Database & cache
+asyncpg>=0.30.0          # async Postgres driver
+redis[hiredis]>=5.2.0    # async Redis client with C parser
+
+# Env loading
+python-dotenv>=1.0.1
+
+# Logging (Pipecat already uses loguru, but pinning for clarity)
+loguru>=0.7.3

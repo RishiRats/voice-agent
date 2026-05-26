@@ -1,0 +1,43 @@
+# Postgres + Redis for local dev.
+# Run with: podman-compose up -d   (or docker-compose up -d)
+#
+# Why these tools:
+# - Postgres holds the tenant config (who the AI is, what business it represents).
+#   This is the "long-lived" data. Survives restarts.
+# - Redis holds the in-call conversation history, keyed by call_id, with a 1h TTL.
+#   This is the "short-lived" data. Cleared automatically after each call ends.
+#   We could use Postgres for this too, but Redis is ~50x faster for the
+#   read-append-write loop that happens on every conversational turn.
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_USER: voice
+      POSTGRES_PASSWORD: voice
+      POSTGRES_DB: voice_agent
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voice"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: docker.io/library/redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:
+  redisdata:

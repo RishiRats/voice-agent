@@ -1,0 +1,95 @@
+-- =============================================================================
+-- TENANTS — one row per business using the platform.
+-- =============================================================================
+-- Everything that makes one AI agent different from another lives in this row.
+-- To onboard a new customer, you INSERT a row. No code change needed.
+--
+-- The `system_prompt` is the most important field: it contains all the business
+-- knowledge, personality, rules, and tool-use instructions. It gets sent to
+-- Sarvam-30B as the first message of every conversation.
+
+CREATE TABLE IF NOT EXISTS tenants (
+    id              BIGSERIAL PRIMARY KEY,
+    name            TEXT NOT NULL,                    -- "Sharma Dental Clinic"
+    inbound_did     TEXT UNIQUE,                      -- "+912240001234" — phone number that routes to this tenant. Nullable until they get a number.
+    system_prompt   TEXT NOT NULL,                    -- The whole persona + business context. Can be huge (10k+ chars), Sarvam-30B has 64K token context.
+    greeting        TEXT NOT NULL,                    -- First sentence the agent speaks when answering.
+    voice           TEXT NOT NULL DEFAULT 'anushka',  -- Bulbul speaker. v3 options: shubh, anushka, meera, pavithra, maitreyi, etc.
+    default_language TEXT NOT NULL DEFAULT 'hi-IN',   -- Hint for STT/TTS. The agent can still switch mid-call.
+    llm_model       TEXT NOT NULL DEFAULT 'sarvam-30b',  -- 'sarvam-30b' for normal, 'sarvam-105b' for complex reasoning
+    temperature     REAL NOT NULL DEFAULT 0.5,        -- LLM sampling temp. Lower = more consistent. Phone agents want low temp.
+    tools_enabled   JSONB NOT NULL DEFAULT '[]'::jsonb,  -- ["check_availability", "book_appointment", "handoff_to_human"]
+    business_hours  JSONB NOT NULL DEFAULT '{}'::jsonb,  -- {"mon-sat": "10:00-20:00", "sun": "closed"}
+    metadata        JSONB NOT NULL DEFAULT '{}'::jsonb,  -- catch-all: doctor names, prices, address, etc. Used by tool endpoints.
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Fast lookup by inbound DID — this is the hot path on every incoming call.
+CREATE INDEX IF NOT EXISTS idx_tenants_inbound_did ON tenants(inbound_did);
+
+
+-- =============================================================================
+-- CALL LOGS — one row per call, persisted after the call ends.
+-- =============================================================================
+-- During the call, conversation history lives in Redis for speed.
+-- When the call ends (or every N turns as a backup), the full transcript
+-- gets written here for analytics, billing, and CRM downstream.
+
+CREATE TABLE IF NOT EXISTS call_logs (
+    id              BIGSERIAL PRIMARY KEY,
+    tenant_id       BIGINT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    call_id         TEXT NOT NULL UNIQUE,             -- our internal ID; also used as Redis key
+    caller_number   TEXT,                             -- E.164 format, NULL for browser-mic test calls
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at        TIMESTAMPTZ,
+    duration_secs   INTEGER,
+    transcript      JSONB,                            -- full messages array: [{role, content}, ...]
+    summary         TEXT,                             -- LLM-generated 1-line summary, written on hangup
+    outcome         TEXT,                             -- 'appointment_booked' | 'lead_captured' | 'transferred' | 'abandoned' | 'unknown'
+    tool_calls      JSONB NOT NULL DEFAULT '[]'::jsonb,  -- audit log of every tool the LLM called
+    cost_paise      INTEGER,                          -- Sarvam costs + telephony, in paise. For billing.
+    metadata        JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_call_logs_tenant_id ON call_logs(tenant_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_call_logs_caller ON call_logs(caller_number, started_at DESC);
+
+
+-- =============================================================================
+-- APPOINTMENTS — example domain table, used by Stage 2's book_appointment tool.
+-- =============================================================================
+-- In a real deployment, different tenants would have different domain tables
+-- (a dental clinic needs appointments, a real estate office needs leads, etc.).
+-- For Stage 1 we just stub one example so you can see the shape.
+
+CREATE TABLE IF NOT EXISTS appointments (
+    id              BIGSERIAL PRIMARY KEY,
+    tenant_id       BIGINT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    call_id         TEXT REFERENCES call_logs(call_id),
+    caller_name     TEXT,
+    caller_phone    TEXT,
+    slot_at         TIMESTAMPTZ NOT NULL,
+    notes           TEXT,
+    status          TEXT NOT NULL DEFAULT 'booked',   -- 'booked' | 'cancelled' | 'completed' | 'no_show'
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_appointments_tenant_slot ON appointments(tenant_id, slot_at);
+
+
+-- =============================================================================
+-- TRIGGER: keep tenants.updated_at fresh
+-- =============================================================================
+CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_tenants_updated_at ON tenants;
+CREATE TRIGGER trg_tenants_updated_at
+    BEFORE UPDATE ON tenants
+    FOR EACH ROW
+    EXECUTE FUNCTION touch_updated_at();

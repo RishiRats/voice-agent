@@ -1,0 +1,1698 @@
+Build Your First Voice Agent using Pipecat
+Overview
+
+This guide demonstrates how to build a real-time voice agent that can listen, understand, and respond naturally using Pipecat for real-time communication and Sarvam AI for speech processing. Perfect for building voice assistants, customer support bots, and conversational AI applications for Indian languages.
+What You’ll Build
+
+A voice agent that can:
+
+    Listen to users speaking (in multiple Indian languages!)
+    Understand and process their requests
+    Respond back in natural-sounding voices
+
+Quick Overview
+
+    Get API keys (Sarvam, OpenAI)
+    Install packages: pip install pipecat-ai[daily,openai,sarvam] python-dotenv
+    Create .env file with your API keys
+    Write ~80 lines of Python code
+    Run with appropriate transport
+
+Quick Start
+1. Prerequisites
+
+    Python 3.9 or higher
+    API keys from:
+        Sarvam AI (get API key from dashboard)
+        OpenAI (create new secret key)
+
+2. Install Dependencies
+macOS/Linux
+Windows
+
+pip install "pipecat-ai[daily,openai]" python-dotenv loguru
+
+3. Create Environment File
+
+Create a file named .env in your project folder and add your API keys:
+
+SARVAM_API_KEY=sk_xxxxxxxxxxxxxxxxxxxxxxxx
+OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxxxxx
+
+Replace the values with your actual API keys.
+4. Write Your Agent
+
+Create agent.py:
+
+import os
+from dotenv import load_dotenv
+from loguru import logger
+from pipecat.frames.frames import LLMRunFrame
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.task import PipelineTask
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+)
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import create_transport
+from pipecat.services.sarvam.stt import SarvamSTTService
+from pipecat.services.sarvam.tts import SarvamTTSService
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.daily.transport import DailyParams
+load_dotenv(override=True)
+async def bot(runner_args: RunnerArguments):
+    """Main bot entry point."""
+    
+    # Create transport (supports both Daily and WebRTC)
+    transport = await create_transport(
+        runner_args,
+        {
+            "daily": lambda: DailyParams(audio_in_enabled=True, audio_out_enabled=True),
+            "webrtc": lambda: TransportParams(
+                audio_in_enabled=True, audio_out_enabled=True
+            ),
+        },
+    )
+    # Initialize AI services
+    stt = SarvamSTTService(api_key=os.getenv("SARVAM_API_KEY"))
+    tts = SarvamTTSService(api_key=os.getenv("SARVAM_API_KEY"))
+    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini")
+    # Set up conversation context
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a friendly AI assistant. Keep your responses brief and conversational.",
+        },
+    ]
+    context = LLMContext(messages)
+    context_aggregator = LLMContextAggregatorPair(context)
+    # Build pipeline
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            stt,
+            context_aggregator.user(),
+            llm,
+            tts,
+            transport.output(),
+            context_aggregator.assistant(),
+        ]
+    )
+    task = PipelineTask(pipeline)
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info("Client connected")
+        messages.append(
+            {"role": "system", "content": "Say hello and briefly introduce yourself."}
+        )
+        await task.queue_frames([LLMRunFrame()])
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info("Client disconnected")
+        await task.cancel()
+    runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+    await runner.run(task)
+if __name__ == "__main__":
+    from pipecat.runner.run import main
+    main()
+
+5. Run Your Agent
+
+For Daily transport:
+
+python agent.py
+
+The agent will create a Daily room and provide you with a URL to join.
+6. Test Your Agent
+
+Open the provided Daily room URL in your browser and start speaking. Your voice agent will listen and respond!
+Customization Examples
+Example 1: Hindi Voice Agent
+
+# Initialize AI services with Hindi support
+stt = SarvamSTTService(
+    api_key=os.getenv("SARVAM_API_KEY"),
+    language="hi-IN",  # Hindi
+    model="saaras:v3",
+    mode="transcribe"
+)
+tts = SarvamTTSService(
+    api_key=os.getenv("SARVAM_API_KEY"),
+    target_language_code="hi-IN",
+    model="bulbul:v3",
+    speaker="simran"  # Or: priya, ishita, kavya, aditya, anand, rohan
+)
+llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini")
+
+Example 2: Tamil Voice Agent
+
+stt = SarvamSTTService(
+    api_key=os.getenv("SARVAM_API_KEY"),
+    language="ta-IN",
+    model="saaras:v3",
+    mode="transcribe"
+)
+tts = SarvamTTSService(
+    api_key=os.getenv("SARVAM_API_KEY"),
+    target_language_code="ta-IN",
+    model="bulbul:v3",
+    speaker="shubh"
+)
+llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini")
+
+Example 3: Multilingual Agent (Auto-detect)
+
+# Auto-detect the user's language
+stt = SarvamSTTService(
+    api_key=os.getenv("SARVAM_API_KEY"),
+    language="unknown",  # Auto-detects language
+    model="saaras:v3",
+    mode="transcribe"
+)
+tts = SarvamTTSService(
+    api_key=os.getenv("SARVAM_API_KEY"),
+    target_language_code="en-IN",
+    model="bulbul:v3",
+    speaker="anand"
+)
+llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini")
+
+Example 4: Speech-to-English Agent (Saaras)
+
+Difference: Saarika transcribes speech to text in the same language, while Saaras translates speech directly to English text. Use Saaras when user speaks Indian languages but you want to process/respond in English.
+
+# User speaks Hindi → Saaras converts to English → LLM processes → Responds in English
+stt = SarvamSTTService(
+    api_key=os.getenv("SARVAM_API_KEY"),
+    model="saaras:v3",
+    mode="translate"  # Speech-to-English translation
+)
+tts = SarvamTTSService(
+    api_key=os.getenv("SARVAM_API_KEY"),
+    target_language_code="en-IN",
+    model="bulbul:v3",
+    speaker="aditya"
+)
+llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o-mini")
+
+Note: Saaras automatically detects the source language (Hindi, Tamil, etc.) and translates spoken content directly to English text, making Indian language speech comprehensible to English-based LLMs.
+Available Options
+Language Codes
+Language	Code
+English (India)	en-IN
+Hindi	hi-IN
+Bengali	bn-IN
+Tamil	ta-IN
+Telugu	te-IN
+Gujarati	gu-IN
+Kannada	kn-IN
+Malayalam	ml-IN
+Marathi	mr-IN
+Punjabi	pa-IN
+Odia	od-IN
+Auto-detect	unknown
+Speaker Voices (Bulbul v3)
+
+Male (23): Shubh (default), Aditya, Rahul, Rohan, Amit, Dev, Ratan, Varun, Manan, Sumit, Kabir, Aayan, Ashutosh, Advait, Anand, Tarun, Sunny, Mani, Gokul, Vijay, Mohit, Rehan, Soham
+
+Female (14): Ritu, Priya, Neha, Pooja, Simran, Kavya, Ishita, Shreya, Roopa, Tanya, Shruti, Suhani, Kavitha, Rupali
+TTS Additional Parameters
+
+You can customize the TTS service with additional parameters:
+
+tts = SarvamTTSService(
+    api_key=os.getenv("SARVAM_API_KEY"),
+    target_language_code="en-IN",
+    model="bulbul:v3",
+    speaker="shubh",
+    pace=1.0,            # Range: 0.5 to 2.0
+    speech_sample_rate=24000  # 8000, 16000, 22050, 24000 Hz (default). v3 REST API also supports 32000, 44100, 48000 Hz
+)
+
+Understanding the Pipeline
+
+Pipecat uses a pipeline architecture where data flows through a series of processors:
+
+User Audio → STT → Context Aggregator → LLM → TTS → Audio Output
+
+    Transport Input: Receives audio from the user
+    STT (Speech-to-Text): Converts audio to text using Sarvam’s Saarika
+    Context Aggregator (User): Adds user message to conversation context
+    LLM: Generates response using OpenAI
+    TTS (Text-to-Speech): Converts response to audio using Sarvam’s Bulbul
+    Transport Output: Sends audio back to the user
+    Context Aggregator (Assistant): Saves assistant’s response to context
+
+Pro Tips
+
+    Use language="unknown" to automatically detect the language. Great for multilingual scenarios!
+    Sarvam’s models understand code-mixing - your agent can naturally handle Hinglish, Tanglish, and other mixed languages.
+    Adjust pace to customize the voice delivery speed.
+    Use gpt-4o-mini for faster responses, or gpt-4o for more complex conversations.
+
+Troubleshooting
+
+API key errors: Check that all keys are in your .env file and the file is in the same directory as your script.
+
+Module not found: Run the installation command again based on your operating system (see Step 2 above).
+
+Poor transcription: Try language="unknown" for auto-detection, or specify the correct language code (en-IN, hi-IN, etc.).
+
+Connection issues: Ensure you have a stable internet connection and the transport is properly configured.
+
+
+
+Saaras
+
+Saaras v3 is our state-of-the-art speech recognition model with flexible output formats. It supports multiple output modes including transcription, translation, verbatim, transliteration, and code-mixed outputs. Saaras is built to make Indic languages LLM-comprehensible, offering accurate transcriptions and translations across 23 languages (22 Indian languages + English).
+
+Saaras v3 is the latest version with improved accuracy and performance. It is available in the Speech-to-Text endpoint (/speech-to-text) and supports multiple output modes via the mode parameter.
+Output Modes
+
+Saaras v3 supports multiple output modes via the mode parameter. Each mode produces different output formats for the same input audio.
+
+Example audio: “मेरा फोन नंबर है 9840950950”
+Mode	Description	Example Output
+transcribe (default)	Standard transcription in the original language with proper formatting and number normalization	मेरा फोन नंबर है 9840950950
+translate	Translates speech from any supported Indic language to English	My phone number is 9840950950
+verbatim	Exact word-for-word transcription without normalization, preserving filler words and spoken numbers as-is	मेरा फोन नंबर है नौ आठ चार zero नौ पांच zero नौ पांच zero
+translit	Romanization - Transliterates speech to Latin/Roman script	mera phone number hai 9840950950
+codemix	Code-mixed text with English words in English and Indic words in native script	मेरा phone number है 9840950950
+Key Features
+Domain-Aware Translation
+
+Advanced prompting system for domain-specific translation and hotword retention, ensuring accurate context preservation.
+Superior Telephony Performance
+
+Optimized for 8KHz telephony audio with enhanced multi-speaker recognition capabilities.
+Intelligent Entity Preservation
+
+Preserves proper nouns and entities accurately across languages, maintaining context and meaning.
+Multi-Language Support
+
+Supports 23 languages (22 Indian + English) with optional language identification.
+Speaker Diarization
+
+Provides diarized outputs with precise timestamps for multi-speaker conversations through batch API.
+Direct Translation
+
+Converts speech directly to English text, eliminating the need for separate transcription and translation steps.
+Language Support
+
+Saaras v3 supports 23 languages (22 Indian languages + English) with comprehensive dialect and accent coverage, including code-mixed audio support and intelligent proper noun preservation for speech-to-English translation.
+Language	Language Code		Language	Language Code
+Hindi	hi-IN		Assamese	as-IN
+Bengali	bn-IN		Urdu	ur-IN
+Kannada	kn-IN		Nepali	ne-IN
+Malayalam	ml-IN		Konkani	kok-IN
+Marathi	mr-IN		Kashmiri	ks-IN
+Odia	od-IN		Sindhi	sd-IN
+Punjabi	pa-IN		Sanskrit	sa-IN
+Tamil	ta-IN		Santali	sat-IN
+Telugu	te-IN		Manipuri	mni-IN
+English	en-IN		Bodo	brx-IN
+Gujarati	gu-IN		Maithili	mai-IN
+			Dogri	doi-IN
+
+Language codes are optional. When not specified or set to unknown, the model will automatically detect the input language and return a language_probability score indicating detection confidence.
+
+Additional Capabilities:
+
+    Includes dialects and accents of the above languages
+    Code-mixed audio support
+    Intelligent Proper Noun and Entity Preservation to ensure proper nouns, regional names, and entities are recognized and retained accurately during transcription
+
+API Response Format
+
+The Speech-to-Text API returns a JSON response with the following fields:
+Field	Type	Description
+request_id	string	Unique identifier for the API request.
+transcript	string	The transcribed text from the provided audio file.
+timestamps	object or null	Contains word-level timestamps (start_time_seconds, end_time_seconds, words). Only included when with_timestamps is set to true.
+diarized_transcript	object or null	Diarized transcript with speaker labels. Available through batch API.
+language_code	string or null	BCP-47 code of the detected language (e.g., hi-IN). Returns the most predominant language if multiple are detected. Returns null if no language is detected.
+language_probability	number or null	Float value (0.0 to 1.0) indicating the probability of the detected language being correct. Higher values indicate higher confidence. Returns a value when language_code is not provided or set to unknown. Returns null when a specific language_code is provided (language detection is skipped). Always present in the response.
+
+Example Response:
+
+{
+  "request_id": "20260209_abc123-def4-5678-ghij-klmnopqrstuv",
+  "transcript": "नमस्ते, आप कैसे हैं?",
+  "timestamps": null,
+  "diarized_transcript": null,
+  "language_code": "hi-IN",
+  "language_probability": 0.95
+}
+
+Key Capabilities
+Transcribe Mode
+Translate Mode
+Verbatim Mode
+Translit Mode
+Codemix Mode
+
+Standard transcription in the original language with proper formatting and number normalization. This is the default mode.
+
+from sarvamai import SarvamAI
+client = SarvamAI(
+    api_subscription_key="YOUR_SARVAM_API_KEY"
+)
+response = client.speech_to_text.transcribe(
+    file=open("audio.wav", "rb"),
+    model="saaras:v3",
+    mode="transcribe"  # default mode
+)
+print(response)
+# Output: मेरा फोन नंबर है 9840950950
+
+Next Steps
+Developer quickstart
+
+Learn how to integrate Saaras v3 into your application.
+API Reference
+
+Complete API documentation for Speech-to-Text endpoint.
+Cookbook
+
+Step-by-step tutorial for speech-to-text transcription.
+
+
+
+
+Bulbul
+
+Bulbul v3 is our latest text-to-speech model, specifically designed for Indian languages and accents. It features improved audio quality, 30+ speaker voices, and supports up to 2500 characters per request.
+Key Features
+30+ Speaker Voices
+
+Wide selection of natural-sounding voices including Shubh, Aditya, Ritu, Simran, Anand, Roopa, Priya, and more.
+Extended Character Limit
+
+Support for up to 2500 characters per request for longer content generation.
+Sample Rate Options
+
+Multiple sample rates: 8kHz, 16kHz, 22.05kHz, 24kHz (default). Higher rates (32kHz, 44.1kHz, 48kHz) available in bulbul:v3 REST API only.
+Language Support
+
+Support for 11 languages (10 Indian + English) with BCP-47 codes. The target language code is primarily used by the pre-TTS text normalization model.
+Natural Prosody
+
+Human-like speech patterns with natural intonation and emotional expression.
+Pace Control
+
+Adjustable speech speed from 0.5x to 2.0x for customized delivery.
+Language Support
+
+Bulbul v3 supports the following Indian languages:
+
+Hindi (hi-IN), Bengali (bn-IN), Tamil (ta-IN), Telugu (te-IN), Gujarati (gu-IN), Kannada (kn-IN), Malayalam (ml-IN), Marathi (mr-IN), Punjabi (pa-IN), Odia (od-IN), English (en-IN)
+Available Speakers
+
+Bulbul v3 offers 30+ speaker voices:
+
+Speakers: Shubh (default), Aditya, Ritu, Priya, Neha, Rahul, Pooja, Rohan, Simran, Kavya, Amit, Dev, Ishita, Shreya, Ratan, Varun, Manan, Sumit, Roopa, Kabir, Aayan, Ashutosh, Advait, Anand, Tanya, Tarun, Sunny, Mani, Gokul, Vijay, Shruti, Suhani, Mohit, Kavitha, Rehan, Soham, Rupali
+
+Use the speaker parameter to select specific voices for your use case. Each speaker has unique characteristics suitable for different applications.
+Key Capabilities
+Basic Usage
+Speaker Selection
+Sample Rate Control
+
+Convert text to speech with default settings. This is the simplest way to get started with Bulbul v3.
+
+from sarvamai import SarvamAI
+from sarvamai.play import play, save
+client = SarvamAI(
+    api_subscription_key="YOUR_SARVAM_API_KEY"
+)
+response = client.text_to_speech.convert(
+    text="Hello, how are you today?",
+    target_language_code="en-IN",
+    model="bulbul:v3"
+)
+# Play the audio
+play(response)
+# Save the response to a file
+save(response, "output.wav")
+
+Next Steps
+Developer quickstart
+
+Learn how to integrate the Bulbul v3 API within your application.
+API Reference
+
+Complete API documentation for text to speech endpoints.
+Cookbook
+
+Step-by-step tutorial for text-to-speech implementation.
+
+
+Sarvam-30B
+
+Sarvam-30B (Chat LLM)
+
+A 30B parameter Mixture-of-Experts reasoning model trained from scratch, optimized for Indian languages with only 2.4B active parameters per token. Delivers strong reasoning, coding, and conversational capabilities while remaining efficient to deploy.
+
+Highlights:
+
+    30B total parameters, 2.4B active — efficient MoE architecture with Grouped Query Attention
+    Pre-trained on 16 trillion tokens across code, math, multilingual, and web data
+    State-of-the-art Indian language performance across native and romanized scripts
+    Optimized inference for H100, L40S, and Apple Silicon (MXFP4)
+    OpenAI-compatible chat completions API
+
+Key Features
+Strong Indian Language Support
+
+Trained on the 10 most-spoken Indian languages with support for native script, romanized, and code-mixed inputs. Wins 89% of pairwise comparisons on Indian language benchmarks and 87% on STEM, math, and coding.
+Efficient MoE Architecture
+
+Mixture-of-Experts Transformer with 128 sparse experts and only 2.4B active parameters per token, enabling high throughput with 3x–6x gains on H100 and local execution on Apple Silicon via MXFP4.
+Reasoning & Coding
+
+Achieves 97.0 on Math500, 92.1 on HumanEval, 92.7 on MBPP, and 88.3 on AIME 25 (96.7 with tools) — exceeding typical expectations for models with similar active compute.
+Agentic Capabilities
+
+Native tool calling with strong performance on BrowseComp (35.5) and Tau2 (45.7) for web-search-driven tasks, planning, retrieval, and multi-step task execution.
+Learn More
+
+For detailed information on architecture, training methodology, performance benchmarks, and inference optimizations, visit our blog.
+Model Specifications
+Key Considerations
+
+    Model ID: sarvam-30b
+    Total Parameters: 30B (2.4B active per token)
+    Architecture: MoE Transformer with GQA and 128 sparse experts
+    Pre-training Data: 16T tokens
+    Temperature range: 0 to 2
+    Top-p range: 0 to 1
+    Supports streaming and non-streaming responses
+    OpenAI-compatible chat completions format
+    License: Apache 2.0
+
+Key Capabilities
+Basic Chat Completion
+Multi-turn Conversation
+Streaming
+
+Simple, one-turn interaction where the user asks a question and the model replies with a single, direct response.
+
+from sarvamai import SarvamAI
+client = SarvamAI(
+    api_subscription_key="YOUR_SARVAM_API_KEY",
+)
+response = client.chat.completions(
+    model="sarvam-30b",
+    messages=[
+        {"role": "user", "content": "Explain the significance of the Indian monsoon season."}
+    ],
+    temperature=0.5,
+    top_p=1,
+    max_tokens=1000,
+)
+print(response.choices[0].message.content)
+
+Next Steps
+Developer quickstart
+
+Learn how to integrate chat completion into your application.
+API Reference
+
+Complete API documentation for chat completion endpoints.
+
+
+
+
+Sarvam-30B
+
+Sarvam-30B (Chat LLM)
+
+A 30B parameter Mixture-of-Experts reasoning model trained from scratch, optimized for Indian languages with only 2.4B active parameters per token. Delivers strong reasoning, coding, and conversational capabilities while remaining efficient to deploy.
+
+Highlights:
+
+    30B total parameters, 2.4B active — efficient MoE architecture with Grouped Query Attention
+    Pre-trained on 16 trillion tokens across code, math, multilingual, and web data
+    State-of-the-art Indian language performance across native and romanized scripts
+    Optimized inference for H100, L40S, and Apple Silicon (MXFP4)
+    OpenAI-compatible chat completions API
+
+Key Features
+Strong Indian Language Support
+
+Trained on the 10 most-spoken Indian languages with support for native script, romanized, and code-mixed inputs. Wins 89% of pairwise comparisons on Indian language benchmarks and 87% on STEM, math, and coding.
+Efficient MoE Architecture
+
+Mixture-of-Experts Transformer with 128 sparse experts and only 2.4B active parameters per token, enabling high throughput with 3x–6x gains on H100 and local execution on Apple Silicon via MXFP4.
+Reasoning & Coding
+
+Achieves 97.0 on Math500, 92.1 on HumanEval, 92.7 on MBPP, and 88.3 on AIME 25 (96.7 with tools) — exceeding typical expectations for models with similar active compute.
+Agentic Capabilities
+
+Native tool calling with strong performance on BrowseComp (35.5) and Tau2 (45.7) for web-search-driven tasks, planning, retrieval, and multi-step task execution.
+Learn More
+
+For detailed information on architecture, training methodology, performance benchmarks, and inference optimizations, visit our blog.
+Model Specifications
+Key Considerations
+
+    Model ID: sarvam-30b
+    Total Parameters: 30B (2.4B active per token)
+    Architecture: MoE Transformer with GQA and 128 sparse experts
+    Pre-training Data: 16T tokens
+    Temperature range: 0 to 2
+    Top-p range: 0 to 1
+    Supports streaming and non-streaming responses
+    OpenAI-compatible chat completions format
+    License: Apache 2.0
+
+Key Capabilities
+Basic Chat Completion
+Multi-turn Conversation
+Streaming
+
+Simple, one-turn interaction where the user asks a question and the model replies with a single, direct response.
+
+from sarvamai import SarvamAI
+client = SarvamAI(
+    api_subscription_key="YOUR_SARVAM_API_KEY",
+)
+response = client.chat.completions(
+    model="sarvam-30b",
+    messages=[
+        {"role": "user", "content": "Explain the significance of the Indian monsoon season."}
+    ],
+    temperature=0.5,
+    top_p=1,
+    max_tokens=1000,
+)
+print(response.choices[0].message.content)
+
+Next Steps
+Developer quickstart
+
+Learn how to integrate chat completion into your application.
+API Reference
+
+Complete API documentation for chat completion endpoints.
+
+
+
+For AI agents: a documentation index is available at the root level at /llms.txt and /llms-full.txt. Append /llms.txt to any URL for a page-level index, or .md for the markdown version of any page.
+Logo
+Community
+API Status
+API Pricing
+Sign Up
+
+    API Reference
+        Introduction
+        Authentication
+        Access to Beta APIs
+        Meta Prompt Guide
+    Endpoints
+            POSTREST
+            WSSWebSocket
+            POSTBatch - Initiate Job
+            POSTBatch - Upload Files
+            POSTBatch - Start Job
+            GETBatch - Get Status
+            POSTBatch - Download Results
+
+Endpoints
+Speech to Text
+REST
+POST
+https://api.sarvam.ai/speech-to-text
+POST
+/speech-to-text
+
+curl -X POST https://api.sarvam.ai/speech-to-text \
+     -H "api-subscription-key: <apiSubscriptionKey>" \
+     -H "Content-Type: multipart/form-data" \
+     -F file=@meeting_recording_2024_04_27.wav
+
+{
+  "request_id": "a1b2c3d4-e5f6-7890-abcd-1234567890ef",
+  "transcript": "नमस्ते, आप कैसे हैं?",
+  "language_code": "hi-IN",
+  "timestamps": {
+    "words": [
+      "नमस्ते,",
+      "आप",
+      "कैसे",
+      "हैं?"
+    ],
+    "start_time_seconds": [
+      0,
+      0.5,
+      1,
+      1.5
+    ],
+    "end_time_seconds": [
+      0.4,
+      0.9,
+      1.4,
+      2
+    ],
+    "timestamps": {
+      "end_time_seconds": [
+        2
+      ],
+      "start_time_seconds": [
+        0
+      ],
+      "words": [
+        "नमस्ते, आप कैसे हैं?"
+      ]
+    }
+  },
+  "diarized_transcript": {
+    "entries": [
+      {
+        "transcript": "नमस्ते, आप कैसे हैं?",
+        "start_time_seconds": 0,
+        "end_time_seconds": 2,
+        "speaker_id": "speaker_1"
+      }
+    ]
+  },
+  "language_probability": 0.95
+}
+
+Speech to Text API
+
+This API transcribes speech to text in multiple Indian languages and English. Supports transcription for interactive applications.
+Available Options:
+
+    REST API (Current Endpoint): For quick responses under 30 seconds with immediate results
+    Batch API: For longer audio files, Follow This Documentation
+        Supports diarization (speaker identification)
+
+Note:
+
+    Pricing differs for REST and Batch APIs
+    Diarization is only available in Batch API with separate pricing
+    Please refer to here for detailed pricing information
+
+Authentication
+api-subscription-keystring
+API Key authentication via header
+Request
+This endpoint expects a multipart form containing a file.
+filefileRequired
+
+The audio file to transcribe. Supported formats include WAV, MP3, AAC, AIFF, OGG, OPUS, FLAC, MP4/M4A, AMR, WMA, WebM, and PCM formats. The API automatically detects most codec formats, but for PCM files (pcm_s16le, pcm_l16, pcm_raw), you must specify the input_audio_codec parameter. PCM files are supported only at 16kHz sample rate. The API works best with audio files sampled at 16kHz. If the audio contains multiple channels, they will be merged into a single channel.
+modelenumOptional
+
+Specifies the model to use for speech-to-text conversion.
+
+    saarika:v2.5 (default): Transcribes audio in the spoken language.
+
+    saaras:v3: State-of-the-art model with flexible output formats. Supports multiple modes via the mode parameter: transcribe, translate, verbatim, translit, codemix.
+
+Allowed values:
+modeenum or nullOptionalDefaults to transcribe
+
+Mode of operation. Only applicable when using saaras:v3 model.
+
+Example audio: ‘मेरा फोन नंबर है 9840950950’
+
+    transcribe (default): Standard transcription in the original language with proper formatting and number normalization.
+        Output: मेरा फोन नंबर है 9840950950
+
+    translate: Translates speech from any supported Indic language to English.
+        Output: My phone number is 9840950950
+
+    verbatim: Exact word-for-word transcription without normalization, preserving filler words and spoken numbers as-is.
+        Output: मेरा फोन नंबर है नौ आठ चार zero नौ पांच zero नौ पांच zero
+
+    translit: Romanization - Transliterates speech to Latin/Roman script only.
+        Output: mera phone number hai 9840950950
+
+    codemix: Code-mixed text with English words in English and Indic words in native script.
+        Output: मेरा phone number है 9840950950
+
+Allowed values:
+language_codeenumOptional
+
+Specifies the language of the input audio in BCP-47 format.
+
+Note: This parameter is optional for saarika:v2.5 model.
+
+Available Options:
+
+    unknown: Use when the language is not known; the API will auto-detect.
+    hi-IN: Hindi
+    bn-IN: Bengali
+    kn-IN: Kannada
+    ml-IN: Malayalam
+    mr-IN: Marathi
+    od-IN: Odia
+    pa-IN: Punjabi
+    ta-IN: Tamil
+    te-IN: Telugu
+    en-IN: English
+    gu-IN: Gujarati
+
+Additional Options (saaras:v3 only):
+
+    as-IN: Assamese
+    ur-IN: Urdu
+    ne-IN: Nepali
+    kok-IN: Konkani
+    ks-IN: Kashmiri
+    sd-IN: Sindhi
+    sa-IN: Sanskrit
+    sat-IN: Santali
+    mni-IN: Manipuri
+    brx-IN: Bodo
+    mai-IN: Maithili
+    doi-IN: Dogri
+
+input_audio_codecenumOptional
+
+Input Audio codec/format of the input file. PCM files are supported only at 16kHz sample rate.
+Response
+Successful Response
+request_idstring or null
+transcriptstring
+The transcribed text from the provided audio file.
+language_codestring or null
+
+This will return the BCP-47 code of language spoken in the input. If multiple languages are detected, this will return language code of most predominant spoken language. If no language is detected, this will be null
+timestampsobject or null
+
+Contains timestamps for the transcribed text. This field is included only if with_timestamps is set to true
+diarized_transcriptobject or null
+Diarized transcript of the provided speech
+language_probabilitydouble or null
+
+Float value (0.0 to 1.0) indicating the probability of the detected language being correct. Higher values indicate higher confidence.
+
+When it returns a value:
+
+    When language_code is not provided in the request
+    When language_code is set to unknown
+
+When it returns null:
+
+    When a specific language_code is provided (language detection is skipped)
+
+The parameter is always present in the response.
+Errors
+400
+Bad Request Error
+403
+Forbidden Error
+422
+Unprocessable Entity Error
+429
+Too Many Requests Error
+500
+Internal Server Error
+503
+Service Unavailable Error
+Was this page helpful?
+WebSocket
+Next
+Built with
+REST | Sarvam API Docs
+
+
+For AI agents: a documentation index is available at the root level at /llms.txt and /llms-full.txt. Append /llms.txt to any URL for a page-level index, or .md for the markdown version of any page.
+Logo
+Community
+API Status
+API Pricing
+Sign Up
+
+    API Reference
+        Introduction
+        Authentication
+        Access to Beta APIs
+        Meta Prompt Guide
+    Endpoints
+            POSTREST
+            WSSWebSocket
+            POSTBatch - Initiate Job
+            POSTBatch - Upload Files
+            POSTBatch - Start Job
+            GETBatch - Get Status
+            POSTBatch - Download Results
+
+Endpoints
+Speech to Text
+WebSocket
+WSS
+wss://api.sarvam.ai/speech-to-text/ws
+Handshake
+URL	wss://api.sarvam.ai/speech-to-text/ws
+Method	GET
+Status	101 Switching Protocols
+Messages
+
+WebSocket channel for real-time speech to text streaming.
+
+Note: This API Reference page is provided for informational purposes only. The Try It playground may not provide the best experience for streaming audio. For optimal streaming performance, please use the SDK or implement your own WebSocket client.
+Handshake
+WSS
+wss://api.sarvam.ai/speech-to-text/ws
+Headers
+Api-Subscription-KeystringRequired
+API subscription key for authentication
+Query parameters
+language-codeenumRequired
+
+Specifies the language of the input audio in BCP-47 format.
+
+Available Options (saarika:v2.5, legacy):
+
+    unknown (default): Use when the language is not known; the API will auto-detect.
+    hi-IN: Hindi
+    bn-IN: Bengali
+    gu-IN: Gujarati
+    kn-IN: Kannada
+    ml-IN: Malayalam
+    mr-IN: Marathi
+    od-IN: Odia
+    pa-IN: Punjabi
+    ta-IN: Tamil
+    te-IN: Telugu
+    en-IN: English
+
+Additional Options (saaras:v3, recommended):
+
+    as-IN: Assamese
+    ur-IN: Urdu
+    ne-IN: Nepali
+    kok-IN: Konkani
+    ks-IN: Kashmiri
+    sd-IN: Sindhi
+    sa-IN: Sanskrit
+    sat-IN: Santali
+    mni-IN: Manipuri
+    brx-IN: Bodo
+    mai-IN: Maithili
+    doi-IN: Dogri
+
+modelenumOptionalDefaults to saaras:v3
+
+Specifies the model to use for speech-to-text conversion.
+
+    saaras:v3 (default, recommended): State-of-the-art model with flexible output formats. Supports multiple modes via the mode parameter: transcribe, translate, verbatim, translit, codemix.
+
+    saarika:v2.5 (legacy): Transcribes audio in the spoken language. Kept for backward compatibility.
+
+Allowed values:
+modeenumOptionalDefaults to transcribe
+
+Mode of operation. Only applicable when using saaras:v3 model.
+
+Example audio: ‘मेरा फोन नंबर है 9840950950’
+
+    transcribe (default): Standard transcription in the original language with proper formatting and number normalization.
+        Output: मेरा फोन नंबर है 9840950950
+
+    translate: Translates speech from any supported Indic language to English.
+        Output: My phone number is 9840950950
+
+    verbatim: Exact word-for-word transcription without normalization, preserving filler words and spoken numbers as-is.
+        Output: मेरा फोन नंबर है नौ आठ चार zero नौ पांच zero नौ पांच zero
+
+    translit: Romanization - Transliterates speech to Latin/Roman script only.
+        Output: mera phone number hai 9840950950
+
+    codemix: Code-mixed text with English words in English and Indic words in native script.
+        Output: मेरा phone number है 9840950950
+
+Allowed values:
+sample_rateenumOptionalDefaults to 16000
+Audio sample rate for the WebSocket connection. When specified as a connection parameter, only 16kHz and 8kHz are supported. 8kHz is only available via this connection parameter. If not specified, defaults to 16kHz.
+Allowed values:
+high_vad_sensitivityenumOptional
+
+Enable high VAD (Voice Activity Detection) sensitivity
+Allowed values:
+positive_speech_thresholdstringOptional
+
+VAD probability threshold (0.0–1.0) above which a frame is considered speech. Overrides the server default when provided.
+negative_speech_thresholdstringOptional
+
+VAD probability threshold (0.0–1.0) below which a frame is considered silence. Overrides the server default (or the high_vad_sensitivity preset) when provided.
+min_speech_framesstringOptional
+Minimum number of consecutive speech frames required to start a speech segment. Overrides the server default when provided.
+first_turn_min_speech_framesstringOptional
+Minimum speech frames required specifically for the first user turn. Overrides the server default when provided.
+negative_frames_countstringOptional
+
+Number of negative (silence) frames needed within the window to end a speech segment. Overrides the server default (or the high_vad_sensitivity preset) when provided.
+negative_frames_windowstringOptional
+
+Sliding window size (in frames) over which negative frames are counted. Overrides the server default (or the high_vad_sensitivity preset) when provided.
+start_speech_volume_thresholdstringOptional
+
+Volume level (dB) below which audio is considered too quiet to be speech. When not provided, no volume-based filtering is applied.
+interrupt_min_speech_framesstringOptional
+
+Minimum speech frames required to register a barge-in / interruption. Overrides the server default when provided.
+pre_speech_pad_framesstringOptional
+Number of audio frames to prepend before the detected speech onset, ensuring the beginning of speech is not clipped. Overrides the server default when provided.
+num_initial_ignored_framesstringOptional
+Number of leading audio frames to skip entirely at connection start. Useful for discarding connection setup noise. Overrides the server default when provided.
+vad_signalsenumOptional
+Enable VAD signals in response
+Allowed values:
+flush_signalenumOptional
+Signal to flush the audio buffer and finalize transcription
+Allowed values:
+input_audio_codecenumOptional
+
+Audio codec/format of the input stream. Use this when sending raw PCM audio. Supported values: wav, pcm_s16le, pcm_l16, pcm_raw.
+Allowed values:
+Send
+Audio Transcription MessageobjectRequired
+
+Send audio data for real-time speech to text streaming
+OR
+Speech Flush SignalobjectRequired
+Send signal to flush audio buffer and finalize transcription
+Receive
+TranscriptionobjectRequired
+
+Receive real-time transcription results from the WebSocket
+Was this page helpful?
+
+Batch - Initiate Job
+Next
+Built with
+WebSocket | Sarvam API Docs
+
+
+For AI agents: a documentation index is available at the root level at /llms.txt and /llms-full.txt. Append /llms.txt to any URL for a page-level index, or .md for the markdown version of any page.
+Logo
+Community
+API Status
+API Pricing
+Sign Up
+
+    API Reference
+        Introduction
+        Authentication
+        Access to Beta APIs
+        Meta Prompt Guide
+    Endpoints
+            POSTREST
+            WSSWebSocket
+            POSTBatch - Initiate Job
+            POSTBatch - Upload Files
+            POSTBatch - Start Job
+            GETBatch - Get Status
+            POSTBatch - Download Results
+            POSTREST
+            POSTREST Stream
+            WSSWebSocket
+
+Endpoints
+Text to Speech
+REST
+POST
+https://api.sarvam.ai/text-to-speech
+POST
+/text-to-speech
+
+curl -X POST https://api.sarvam.ai/text-to-speech \
+     -H "api-subscription-key: <apiSubscriptionKey>" \
+     -H "Content-Type: application/json" \
+     -d '{
+  "text": "Hello, welcome to Sarvam'\''s text-to-speech service. This demo converts your text into natural spoken audio.",
+  "target_language_code": "en-IN"
+}'
+
+{
+  "request_id": "a1b2c3d4-e5f6-7890-ab12-cd34ef567890",
+  "audios": [
+    "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA="
+  ]
+}
+
+Convert text into spoken audio. The output is a base64-encoded audio string that must be decoded before use.
+
+Available Models:
+
+    bulbul:v3: Latest model with improved quality, 30+ voices, and temperature control
+    bulbul:v2: Legacy model with pitch and loudness controls
+
+Important Notes for bulbul:v3:
+
+    Pitch and loudness parameters are NOT supported
+    Pace range: 0.5 to 2.0
+    Preprocessing is automatically enabled
+    Default sample rate is 24000 Hz
+    Supports sample rates: 8000, 16000, 22050, 24000 Hz (REST API also supports 32000, 44100, 48000 Hz)
+
+Authentication
+api-subscription-keystring
+API Key authentication via header
+Request
+This endpoint expects an object.
+textstringRequired
+
+The text(s) to be converted into speech.
+
+Features:
+
+    Supports code-mixed text (English and Indic languages)
+
+Model-specific limits:
+
+    bulbul:v3: Max 2500 characters
+    bulbul:v2: Max 1500 characters
+
+Important Note:
+
+    For numbers larger than 4 digits, use commas (e.g., ‘10,000’ instead of ‘10000’)
+    This ensures proper pronunciation as a whole number
+
+target_language_codeenumRequired
+
+The language code in BCP-47 format.
+speakerenum or nullOptional
+
+The speaker voice to be used for the output audio.
+
+Default: shubh (for bulbul:v3), anushka (for bulbul:v2)
+
+Model Compatibility (Speakers compatible with respective model):
+
+    bulbul:v3:
+        shubh (default), aditya, ritu, priya, neha, rahul, pooja, rohan, simran, kavya, amit, dev, ishita, shreya, ratan, varun, manan, sumit, roopa, kabir, aayan, ashutosh, advait, anand, tanya, tarun, sunny, mani, gokul, vijay, shruti, suhani, mohit, kavitha, rehan, soham, rupali
+    bulbul:v2:
+        Female: anushka, manisha, vidya, arya
+        Male: abhilash, karun, hitesh
+
+Note: Speaker selection must match the chosen model version.
+
+Important: Speaker names are case-sensitive and must be lowercase (e.g., ritu not Ritu).
+pitchdouble or nullOptional
+
+Controls the pitch of the audio. Lower values result in a deeper voice, while higher values make it sharper. The suitable range is between -0.75 and 0.75. Default is 0.0.
+
+Note: This parameter is only supported for bulbul:v2. It is NOT supported for bulbul:v3.
+pacedouble or nullOptional
+0.3-3
+Defaults to 1
+
+Controls the speed of the audio. Lower values result in slower speech, while higher values make it faster. Default is 1.0.
+
+Model-specific ranges:
+
+    bulbul:v3: 0.5 to 2.0
+    bulbul:v2: 0.3 to 3.0
+
+loudnessdouble or nullOptional
+0.1-3
+
+Controls the loudness of the audio. Lower values result in quieter audio, while higher values make it louder. The suitable range is between 0.3 and 3.0. Default is 1.0.
+
+Note: This parameter is only supported for bulbul:v2. It is NOT supported for bulbul:v3.
+speech_sample_rateenum or nullOptional
+
+Specifies the sample rate of the output audio. Supported values are 8000, 16000, 22050, 24000, 32000, 44100, 48000 Hz.
+
+Note: Higher sample rates (32000, 44100, 48000 Hz) are only available with bulbul:v3 via the REST API, not in streaming mode.
+
+Default: 24000 Hz
+enable_preprocessingbooleanOptionalDefaults to false
+
+Controls whether normalization of English words and numeric entities (e.g., numbers, dates) is performed. Set to true for better handling of mixed-language text.
+
+Model-specific behavior:
+
+    bulbul:v3: Not Supported
+    bulbul:v2: Default is false
+
+modelenumOptional
+
+Specifies the model to use for text-to-speech conversion.
+
+Available models:
+
+    bulbul:v3: Latest model with improved quality, 30+ voices, pace, and temperature control
+    bulbul:v2: Legacy model with pitch, loudness, and pace controls
+
+Allowed values:
+output_audio_codecenum or nullOptional
+Specifies the audio codec for the output audio file. Different codecs offer various compression and quality characteristics.
+temperaturedouble or nullOptional
+0.01-2
+Defaults to 0.6
+
+Temperature controls how much randomness and expressiveness the TTS model uses while generating speech.
+
+Lower values produce more stable and consistent output, while higher values sound more expressive but may introduce artifacts or errors. The suitable range is between 0.01 and 2.0. Default is 0.6.
+
+Note: This parameter is only supported for bulbul:v3. It has no effect on bulbul:v2.
+dict_idstring or nullOptional
+
+The ID of a pronunciation dictionary to apply during synthesis. When provided, matching words in the input text will be replaced with their custom pronunciations before generating speech.
+
+Create and manage dictionaries via the Pronunciation Dictionary API. Only supported by bulbul:v3.
+enable_cached_responsesbooleanOptionalDefaults to false
+
+Enable caching for the request. When enabled, identical requests will return cached audio instead of regenerating. Default is false.
+
+Note: Currently in beta and only available for bulbul:v1 and bulbul:v2 models.
+Response
+Successful Response
+request_idstring or null
+audioslist of strings
+The output audio files in WAV format, encoded as base64 strings. Each string corresponds to one of the input texts.
+Errors
+400
+Bad Request Error
+403
+Forbidden Error
+422
+Unprocessable Entity Error
+429
+Too Many Requests Error
+500
+Internal Server Error
+Was this page helpful?
+REST Stream
+Next
+Built with
+REST | Sarvam API Docs
+
+
+For AI agents: a documentation index is available at the root level at /llms.txt and /llms-full.txt. Append /llms.txt to any URL for a page-level index, or .md for the markdown version of any page.
+Logo
+Community
+API Status
+API Pricing
+Sign Up
+
+    API Reference
+        Introduction
+        Authentication
+        Access to Beta APIs
+        Meta Prompt Guide
+    Endpoints
+            POSTREST
+            WSSWebSocket
+            POSTBatch - Initiate Job
+            POSTBatch - Upload Files
+            POSTBatch - Start Job
+            GETBatch - Get Status
+            POSTBatch - Download Results
+            POSTREST
+            POSTREST Stream
+            WSSWebSocket
+
+Endpoints
+Text to Speech
+REST Stream
+POST
+https://api.sarvam.ai/text-to-speech/stream
+POST
+/text-to-speech/stream
+
+curl -X POST https://api.sarvam.ai/text-to-speech/stream \
+     -H "api-subscription-key: <apiSubscriptionKey>" \
+     -H "Content-Type: application/json" \
+     -d '{
+  "text": "Welcome to Sarvam'\''s text-to-speech streaming service. This demo converts your text into natural spoken audio.",
+  "target_language_code": "en-IN",
+  "speaker": "shubh",
+  "pitch": 0,
+  "pace": 1,
+  "loudness": 1,
+  "speech_sample_rate": 22050,
+  "enable_preprocessing": false,
+  "model": "bulbul:v3",
+  "temperature": 0.6,
+  "enable_cached_responses": false,
+  "dict_id": null,
+  "output_audio_codec": "mp3",
+  "output_audio_bitrate": "128k"
+}'
+
+"binary audio stream"
+
+Converts the input text into a streamed spoken audio response.
+
+This endpoint supports streaming audio using the specified output codec (e.g., audio/mpeg for MP3). The response is returned as a binary audio stream, which can be played or saved directly by the client.
+
+Supports the dict_id parameter to apply a pronunciation dictionary during synthesis.
+Authentication
+api-subscription-keystring
+API Key authentication via header
+Request
+This endpoint expects an object.
+textstringRequired
+1-3500 characters
+
+The text to be converted into streamed speech.
+
+Features:
+
+    Max 3500 characters
+    Supports code-mixed text (English and Indic languages)
+
+Important Note:
+
+    For numbers larger than 4 digits, use commas (e.g., ‘10,000’ instead of ‘10000’)
+    This ensures proper pronunciation as a whole number
+
+target_language_codeenumOptional
+
+The language code in BCP-47 format.
+speakerenum or nullOptional
+
+The speaker voice to be used for the output audio.
+
+Default: shubh (for bulbul:v3), anushka (for bulbul:v2)
+
+Note: Speaker selection must match the chosen model version.
+
+Important: Speaker names are case-sensitive and must be lowercase (e.g., ritu not Ritu).
+pitchdouble or nullOptional
+-1-1
+
+Controls the pitch of the audio. Range: -0.75 to 0.75. Default is 0.0.
+
+Note: Only supported for bulbul:v2.
+pacedouble or nullOptional
+0.3-3
+Defaults to 1
+
+Controls the speed of the audio. Default is 1.0.
+
+Model-specific ranges:
+
+    bulbul:v3: 0.5 to 2.0
+    bulbul:v2: 0.3 to 3.0
+
+loudnessdouble or nullOptional
+0.1-3
+
+Controls the loudness of the audio. Range: 0.3 to 3.0. Default is 1.0.
+
+Note: Only supported for bulbul:v2.
+speech_sample_rateenum or nullOptional
+
+Specifies the sample rate of the output audio. Default is 22050 Hz.
+
+Note: OPUS codec only supports 8000, 12000, 16000, 24000, 48000 Hz.
+enable_preprocessingbooleanOptionalDefaults to false
+Controls whether normalization of English words and numeric entities is performed. Default is false.
+modelenumOptional
+
+Specifies the model to use for text-to-speech conversion. Default is bulbul:v2.
+Allowed values:
+temperaturedouble or nullOptional
+0.01-1
+Defaults to 0.6
+
+Controls the randomness of the output. Range: 0.01 to 1.0. Default is 0.6.
+
+Note: Only supported for bulbul:v3.
+enable_cached_responsesbooleanOptionalDefaults to false
+Enable caching for the request. Default is false. Currently in beta.
+dict_idstring or nullOptional
+
+The ID of a pronunciation dictionary to apply during synthesis. When provided, matching words in the input text will be replaced with their custom pronunciations before generating speech.
+
+Create and manage dictionaries via the Pronunciation Dictionary API. Only supported by bulbul:v3.
+output_audio_codecenumOptional
+
+Specifies the codec for the streamed output audio (e.g., ‘mp3’).
+output_audio_bitrateenumOptional
+Bitrate for the streamed output audio. Default is '128k'.
+Allowed values:
+Response
+
+Success. Returns a streamed audio response in the requested format (e.g., audio/mpeg for MP3, audio/wav for WAV).
+Errors
+400
+Bad Request Error
+403
+Forbidden Error
+422
+Unprocessable Entity Error
+429
+Too Many Requests Error
+500
+Internal Server Error
+Was this page helpful?
+WebSocket
+Next
+Built with
+REST Stream | Sarvam API Docs
+
+
+For AI agents: a documentation index is available at the root level at /llms.txt and /llms-full.txt. Append /llms.txt to any URL for a page-level index, or .md for the markdown version of any page.
+Logo
+Community
+API Status
+API Pricing
+Sign Up
+
+    API Reference
+        Introduction
+        Authentication
+        Access to Beta APIs
+        Meta Prompt Guide
+    Endpoints
+            POSTREST
+            WSSWebSocket
+            POSTBatch - Initiate Job
+            POSTBatch - Upload Files
+            POSTBatch - Start Job
+            GETBatch - Get Status
+            POSTBatch - Download Results
+            POSTREST
+            POSTREST Stream
+            WSSWebSocket
+
+Endpoints
+Text to Speech
+WebSocket
+WSS
+wss://api.sarvam.ai/text-to-speech/ws
+Handshake
+URL	wss://api.sarvam.ai/text-to-speech/ws
+Method	GET
+Status	101 Switching Protocols
+Messages
+
+WebSocket channel for real-time TTS synthesis.
+
+Note: This API Reference page is provided for informational purposes only. The Try It playground may not provide the best experience for streaming audio. For optimal streaming performance, please use the SDK or implement your own WebSocket client.
+
+Model-Specific Notes:
+
+    bulbul:v2: Supports pitch, loudness, pace (0.3-3.0). Default sample rate: 22050 Hz.
+    bulbul:v3: Does NOT support pitch/loudness. Pace range: 0.5-2.0. Supports temperature parameter. Default sample rate: 24000 Hz. Preprocessing is always enabled.
+
+Handshake
+WSS
+wss://api.sarvam.ai/text-to-speech/ws
+Headers
+Api-Subscription-KeystringRequired
+API subscription key for authentication
+Query parameters
+modelenumOptionalDefaults to bulbul:v2
+
+Text to speech model to use.
+
+    bulbul:v2 (default): Standard TTS model with pitch/loudness support
+    bulbul:v3: Advanced model with temperature control (no pitch/loudness)
+
+Allowed values:
+send_completion_eventenumOptionalDefaults to true
+Enable completion event notifications when TTS generation finishes. When set to true, an event message will be sent when the final audio chunk has been generated.
+Allowed values:
+Send
+Configure ConnectionobjectRequired
+
+Send initial configuration for text-to-speech streaming
+OR
+Send TextobjectRequired
+Send text chunk for speech synthesis
+OR
+Flush SignalobjectRequired
+Send signal to end text streaming.
+OR
+Ping SignalobjectRequired
+Send ping signal to keep the TTS WebSocket connection alive.
+Receive
+Audio OutputobjectRequired
+Receive audio chunks from the TTS WebSocket.
+OR
+Event NotificationobjectRequired
+
+Receive completion event notifications from the TTS WebSocket (if send_completion_event is enabled)
+OR
+Error ResponseobjectRequired
+Receive error messages from the TTS WebSocket
+Was this page helpful?
+Create
+Next
+Built with
+WebSocket | Sarvam API Docs
+Double click to editDouble click to edit
+
+
+
+For AI agents: a documentation index is available at the root level at /llms.txt and /llms-full.txt. Append /llms.txt to any URL for a page-level index, or .md for the markdown version of any page.
+Logo
+Community
+API Status
+API Pricing
+Sign Up
+
+    API Reference
+        Introduction
+        Authentication
+        Access to Beta APIs
+        Meta Prompt Guide
+    Endpoints
+            POSTChat Completion
+
+Endpoints
+Chat Completion
+Chat Completion
+POST
+https://api.sarvam.ai/v1/chat/completions
+POST
+/v1/chat/completions
+
+curl -X POST https://api.sarvam.ai/v1/chat/completions \
+     -H "Authorization: Bearer <token>" \
+     -H "Content-Type: application/json" \
+     -d '{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello, can you explain the theory of relativity?"
+    }
+  ],
+  "model": "sarvam-105b"
+}'
+
+{
+  "id": "chatcmpl-7a1b2c3d4e5f67890123456789abcdef",
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "The theory of relativity, developed by Albert Einstein, includes both the special and general relativity theories. Special relativity deals with objects moving at constant speeds, especially near the ",
+        "role": "assistant",
+        "refusal": "",
+        "reasoning_content": "To provide a concise explanation, I summarized the key points of both special and general relativity.",
+        "tool_calls": [
+          {
+            "id": "toolcall-1234abcd",
+            "type": "function",
+            "function": {
+              "name": "fetch_wikipedia_summary",
+              "arguments": "{\"topic\": \"Theory of Relativity\"}"
+            }
+          }
+        ]
+      },
+      "logprobs": {}
+    }
+  ],
+  "created": 1712345678,
+  "model": "sarvam-105b",
+  "object": "chat.completion",
+  "service_tier": "premium",
+  "system_fingerprint": "sysfp-20240601-abcdef123456",
+  "usage": {
+    "completion_tokens": 150,
+    "prompt_tokens": 20,
+    "total_tokens": 170,
+    "completion_tokens_details": {},
+    "prompt_tokens_details": {}
+  }
+}
+
+Authentication
+AuthorizationBearer
+
+Bearer authentication of the form Bearer <token>, where token is your auth token.
+api-subscription-keystring
+API Key authentication via header
+Headers
+api-subscription-keystring or nullOptional
+
+API subscription key in sk_xxx format. Steps to get your key
+Request
+This endpoint expects an object.
+messageslist of objectsRequired
+A list of messages comprising the conversation so far.
+assistantobjectRequired
+role"assistant"Required
+contentstring or nullOptional
+The contents of the assistant message
+tool_callslist of objects or nullOptional
+The tool calls generated by the model.
+OR
+systemobjectRequired
+role"system"Required
+contentstringRequired
+The contents of the system message.
+OR
+toolobjectRequired
+role"tool"Required
+contentstringRequired
+The contents of the tool message.
+tool_call_idstringRequired
+Tool call that this message is responding to.
+OR
+userobjectRequired
+role"user"Required
+contentstringRequired
+The contents of the user message.
+modelenumRequired
+
+Chat model ID. Prefer sarvam-30b (64K context) or sarvam-105b (128K context) for new workloads. The value sarvam-m is a legacy 24B model that remains accepted; migrate to Sarvam-30B or Sarvam-105B for better performance.
+Allowed values:
+temperaturedouble or nullOptional
+0-2
+Defaults to 0.2
+
+What sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output more random, while lower values like 0.2 will make it more focused and deterministic. We generally recommend altering this or top_p but not both.
+top_pdouble or nullOptional
+0-1
+Defaults to 1
+
+An alternative to sampling with temperature, called nucleus sampling, where the model considers the results of the tokens with top_p probability mass. So 0.1 means only the tokens comprising the top 10% probability mass are considered.
+
+We generally recommend altering this or temperature but not both.
+reasoning_effortenum or nullOptional
+The effort to use for reasoning. Can be disabled by explicitly setting to None. Default is 'medium'.
+Allowed values:
+max_tokensinteger or nullOptionalDefaults to 2048
+The maximum number of tokens that can be generated in the chat completion.
+streamboolean or nullOptionalDefaults to false
+
+If set to true, the model response data will be streamed to the client as it is generated using server-sent events.
+stopstring or list of strings or nullOptional
+Up to 4 sequences where the API will stop generating further tokens. The returned text will not contain the stop sequence.
+stringRequired
+OR
+list of stringsRequired
+ninteger or nullOptional
+1-128
+Defaults to 1
+
+How many chat completion choices to generate for each input message. Note that you will be charged based on the number of generated tokens across all of the choices. Keep n as 1 to minimize costs.
+seedinteger or nullOptional
+-9223372036854776000-9223372036854776000
+
+This feature is in Beta. If specified, our system will make a best effort to sample deterministically, such that repeated requests with the same seed and parameters should return the same result. Determinism is not guaranteed, and you should refer to the system_fingerprint response parameter to monitor changes in the backend.
+frequency_penaltydouble or nullOptional
+-2-2
+Defaults to 0
+
+Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far, decreasing the model’s likelihood to repeat the same line verbatim.
+presence_penaltydouble or nullOptional
+-2-2
+Defaults to 0
+
+Number between -2.0 and 2.0. Positive values penalize new tokens based on whether they appear in the text so far, increasing the model’s likelihood to talk about new topics.
+wiki_groundingboolean or nullOptionalDefaults to false
+If set to true, the model response will be wiki grounded.
+toolslist of objects or nullOptional
+A list of tools the model may call. Currently, only functions are supported as a tool.
+type"function"Required
+
+The type of the tool. Currently, only function is supported.
+functionobjectRequired
+namestringRequired
+The name of the function to be called.
+descriptionstring or nullOptional
+A description of what the function does.
+parametersmap from strings to any or nullOptional
+The parameters the function accepts, described as a JSON Schema object.
+tool_choiceenum or object or nullOptional
+
+Controls which (if any) tool is called by the model.
+enumRequired
+Allowed values:
+OR
+ChatCompletionNamedToolChoiceobjectRequired
+type"function"Required
+
+The type of the tool. Currently, only function is supported.
+functionobjectRequired
+Response
+Successful Response
+idstring
+A unique identifier for the chat completion.
+choiceslist of objects
+
+A list of chat completion choices. Can be more than one if n is greater than 1.
+finish_reasonenum
+
+The reason the model stopped generating tokens. This will be stop if the model hit a natural stop point or a provided stop sequence, length if the maximum number of tokens specified in the request was reached, content_filter if content was omitted due to a flag from our content filters, tool_calls if the model called a tool, or function_call (deprecated) if the model called a function.
+Allowed values:
+indexinteger
+The index of the choice in the list of choices.
+messageobject
+contentstring or null
+The contents of the message.
+roleenum
+The role of the author of this message.
+Allowed values:
+refusalstring or null
+reasoning_contentstring or null
+The contents of the reasoning message.
+tool_callslist of objects or null
+The tool calls generated by the model.
+logprobsmap from strings to any or null
+createdinteger
+
+The Unix timestamp (in seconds) of when the chat completion was created.
+modelstring
+The model used for the chat completion.
+object"chat.completion"
+
+The object type, which is always chat.completion.
+service_tierstring or null
+system_fingerprintstring or null
+usageobject or null
+completion_tokensinteger
+Number of tokens in the generated completion.
+prompt_tokensinteger
+Number of tokens in the prompt.
+total_tokensinteger
+
+Total number of tokens used in the request (prompt + completion).
+completion_tokens_detailsmap from strings to any or null
+prompt_tokens_detailsmap from strings to any or null
+Errors
+400
+Bad Request Error
+403
+Forbidden Error
+422
+Unprocessable Entity Error
+429
+Too Many Requests Error
+500
+Internal Server Error
+Was this page helpful?
+Create Document Intelligence Job
+Next
+Built with
+Chat Completion | Sarvam API Docs
+

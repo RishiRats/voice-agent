@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pipx --version)",
+      "Bash(pip3 --version)",
+      "Bash(python3 -m pip --version)",
+      "Read(//usr/bin/**)",
+      "Bash(python3 -m venv .venv)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(podman run *)",
+      "Bash(.venv/bin/python3 *)",
+      "Bash(podman exec *)",
+      "Bash(kill %1)",
+      "Bash(jobs -l)",
+      "Bash(fuser -k 7860/tcp)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:7860/client)",
+      "Bash(curl *)",
+      "Bash(.venv/bin/python3 -m app.main)",
+      "Bash(echo \"PID: $!\")",
+      "Read(//tmp/**)",
+      "Bash(python3 -c \"import anthropic; print\\('anthropic installed:', anthropic.__version__\\)\")",
+      "Bash(printenv ANTHROPIC_API_KEY)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); k=d.get\\('apiKey',''\\); print\\('claude config key:', k[:10]+'...' if k else 'not found'\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); [print\\(m['name']\\) for m in d.get\\('models',[]\\)]\")",
+      "Bash(awk '/14:26:57/ {found=1} found && /14:31:48/ {exit} found {print}' /tmp/voice_agent.log)",
+      "Bash(.venv/bin/python -m app.db.migrate)",
+      "Bash(pkill -f \"app.main\")",
+      "Bash(awk '{print $2}')",
+      "Bash(xargs -r kill -9)",
+      "Bash(.venv/bin/python -m app.main)",
+      "Bash(tee /tmp/voice_agent.log)",
+      "Bash(echo \"Agent PID: $!\")",
+      "Bash(.venv/bin/pip show *)",
+      "Bash(.venv/bin/pip list *)",
+      "Bash(.venv/bin/python *)",
+      "Bash(grep -v \"^$\")",
+      "Bash(git init *)",
+      "Bash(git add *)"
+    ]
+  }
+}
