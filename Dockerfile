@@ -34,9 +34,14 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 FROM python:3.14-slim-bookworm AS runtime
 
 # Runtime-only deps. No compilers in the final image.
-# libsndfile is for audio I/O if pipecat needs it.
+# libsndfile1: audio I/O (pipecat)
+# libxcb1, libgl1, libglib2.0-0: opencv-python (cv2) is a transitive pipecat
+#   dep and loads X11/GL/GLib shared libs at import time even in headless use.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
+    libxcb1 \
+    libgl1 \
+    libglib2.0-0 \
     ca-certificates \
     curl \
     && rm -rf /var/lib/apt/lists/* \
