@@ -2,7 +2,7 @@
 # - sarvam: STT, TTS, LLM service classes
 # - webrtc: SmallWebRTCTransport (browser mic in Stage 1)
 # - silero: VAD (voice activity detection — knows when caller has finished talking)
-pipecat-ai[sarvam,webrtc,silero]>=0.0.108
+pipecat-ai[sarvam,webrtc,silero,google]>=0.0.108
 
 # Database & cache
 asyncpg>=0.30.0          # async Postgres driver
@@ -13,6 +13,13 @@ python-dotenv>=1.0.1
 
 # Logging (Pipecat already uses loguru, but pinning for clarity)
 loguru>=0.7.3
+
+# Web framework for the tools server + Pipecat runner
+fastapi>=0.115.6
+uvicorn[standard]>=0.32.0
+
+# pipecat-ai[webrtc] extra dep — pip-compile omits it without explicit pin
+pipecat-ai-small-webrtc-prebuilt>=2.5.0
 
 # Rate limiting for FastAPI tools service (cost protection)
 slowapi>=0.1.9

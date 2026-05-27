@@ -1,0 +1,129 @@
+# Full-stack compose for both local Docker dev and production VPS deploy.
+# Run with: docker compose up -d  (or `podman-compose up -d` if you prefer)
+#
+# Environment variables are loaded from .env at compose-time.
+# Override per-environment with .env.production (or pass --env-file).
+
+services:
+  # ─────────────────────────────────────────────────
+  # Postgres — same config as before, but bound to internal network only.
+  # No host port mapping in production (set via override).
+  # ─────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: voice
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: voice_agent
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Internal network only — no host port published.
+    # For local development DB access, see docker-compose.override.yaml.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voice -d voice_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ─────────────────────────────────────────────────
+  # Redis — internal network only.
+  # ─────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ─────────────────────────────────────────────────
+  # Migration runner — runs once at startup to ensure schema is up to date.
+  # Exits cleanly after migration. The agent and tools services wait on
+  # this completing via depends_on.
+  # ─────────────────────────────────────────────────
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: voice-agent:latest
+    command: ["python", "-m", "app.db.migrate"]
+    env_file:
+      - .env
+    environment:
+      POSTGRES_URL: postgresql://voice:${POSTGRES_PASSWORD}@postgres:5432/voice_agent
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ─────────────────────────────────────────────────
+  # Tools server — internal only, no host port.
+  # Reached by the agent via http://tools:8000 (Docker DNS).
+  # ─────────────────────────────────────────────────
+  tools:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: voice-agent:latest
+    command: ["python", "-m", "app.tools.server"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Override host-only env vars so the service binds to all
+      # interfaces *inside the container* (still not exposed externally).
+      TOOLS_HOST: 0.0.0.0
+      POSTGRES_URL: postgresql://voice:${POSTGRES_PASSWORD}@postgres:5432/voice_agent
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      TOOLS_BASE_URL: http://tools:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ─────────────────────────────────────────────────
+  # Agent — the only service that needs external network exposure.
+  # In production, sits behind nginx (next stage).
+  # ─────────────────────────────────────────────────
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: voice-agent:latest
+    # Pipecat's runner reads --host/--port from CLI args, not env vars.
+    # 0.0.0.0 binds inside the container; Docker maps the port externally.
+    command: ["python", "-m", "app.main", "--host", "0.0.0.0", "--port", "7860"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_URL: postgresql://voice:${POSTGRES_PASSWORD}@postgres:5432/voice_agent
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      TOOLS_BASE_URL: http://tools:8000
+    ports:
+      # Externally accessible port. In production, only nginx talks to this.
+      - "${WEBRTC_HOST_PORT:-127.0.0.1}:${WEBRTC_PORT:-7860}:7860"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      tools:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:

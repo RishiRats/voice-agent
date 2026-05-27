@@ -1,0 +1,16 @@
+# Local development overrides.
+# Auto-loaded by `docker compose up` when this file exists.
+# NOT used in production (we'll explicitly pass --file in deploy).
+
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  redis:
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  tools:
+    ports:
+      - "127.0.0.1:8000:8000"
