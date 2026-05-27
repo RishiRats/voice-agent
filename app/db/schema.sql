@@ -99,3 +99,35 @@ CREATE TRIGGER trg_tenants_updated_at
     BEFORE UPDATE ON tenants
     FOR EACH ROW
     EXECUTE FUNCTION touch_updated_at();
+
+
+-- =============================================================================
+-- RETENTION POLICY — delete call data older than default_days (default 90).
+-- Run via: python -m app.db.retention_job
+-- =============================================================================
+CREATE OR REPLACE FUNCTION enforce_retention(default_days INTEGER DEFAULT 90)
+RETURNS TABLE(table_name TEXT, rows_deleted BIGINT) AS $$
+DECLARE
+    logs_deleted BIGINT;
+    appts_deleted BIGINT;
+BEGIN
+    WITH deleted AS (
+        DELETE FROM call_logs
+        WHERE started_at < NOW() - (default_days || ' days')::INTERVAL
+        RETURNING id
+    )
+    SELECT COUNT(*) INTO logs_deleted FROM deleted;
+
+    WITH deleted AS (
+        DELETE FROM appointments
+        WHERE slot_at < NOW() - (default_days || ' days')::INTERVAL
+          AND status IN ('completed', 'cancelled', 'no_show')
+        RETURNING id
+    )
+    SELECT COUNT(*) INTO appts_deleted FROM deleted;
+
+    RETURN QUERY VALUES
+        ('call_logs', logs_deleted),
+        ('appointments', appts_deleted);
+END;
+$$ LANGUAGE plpgsql;

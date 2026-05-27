@@ -12,3 +12,8 @@ build/
 .pytest_cache/
 .mypy_cache/
 *.log
+
+# Loose documentation / scratch files — commit only named files explicitly below
+*.txt
+!requirements.txt
+!LICENSE.txt

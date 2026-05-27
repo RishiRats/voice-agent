@@ -22,6 +22,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from app import config
+from app.services.log_redact import redact_phone, redact_name
 
 app = FastAPI(title="Voice Agent Tools")
 
@@ -272,7 +273,8 @@ async def book_appointment(request: Request, req: BookAppointmentRequest):
 
     logger.info(
         f"BOOKED: id={row['id']} tenant={req.tenant_id} "
-        f"{req.caller_name} {req.caller_phone} {row['slot_at'].isoformat()}"
+        f"name={redact_name(req.caller_name)} phone={redact_phone(req.caller_phone)} "
+        f"slot={row['slot_at'].isoformat()}"
     )
 
     return BookAppointmentResponse(

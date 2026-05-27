@@ -119,3 +119,19 @@ The `tenants` table holds everything that makes one agent different from another
 - `tools_enabled` — JSON list of which tool endpoints this tenant can call
 
 Adding a new tenant later is just `INSERT INTO tenants ...`. No code change.
+
+---
+
+## Data retention
+
+Run `python -m app.db.retention_job` to enforce the retention policy.
+Default: 90 days. Override via `RETENTION_DAYS=N`. In production, schedule
+daily via cron or a systemd timer.
+
+```bash
+# Manual run (safe — reports 0 deletions on fresh data)
+python -m app.db.retention_job
+
+# Override retention window
+RETENTION_DAYS=30 python -m app.db.retention_job
+```
