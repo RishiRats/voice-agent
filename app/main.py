@@ -630,6 +630,21 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    # Dev mode: start the SmallWebRTC test runner as before.
+    # Dev mode: start the SmallWebRTC test runner.
+    # pipecat's runner creates SmallWebRTCRequestHandler with no ice_servers, so
+    # the server only generates Docker-internal IP candidates. Patch the class
+    # before main() calls _setup_webrtc_routes so the handler gets Google STUN.
+    import pipecat.transports.smallwebrtc.request_handler as _rh
+    from pipecat.transports.smallwebrtc.connection import IceServer as _IceServer
+    _OrigHandler = _rh.SmallWebRTCRequestHandler
+
+    class _STUNRequestHandler(_OrigHandler):
+        def __init__(self, ice_servers=None, **kwargs):
+            if not ice_servers:
+                ice_servers = [_IceServer(urls=["stun:stun.l.google.com:19302"])]
+            super().__init__(ice_servers=ice_servers, **kwargs)
+
+    _rh.SmallWebRTCRequestHandler = _STUNRequestHandler
+
     from pipecat.runner.run import main
     main()
