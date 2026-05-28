@@ -50,6 +50,7 @@ from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 from pipecat.transcriptions.language import Language
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
@@ -510,7 +511,11 @@ async def bot(runner_args: RunnerArguments):
                 "webrtc": lambda: TransportParams(
                     audio_in_enabled=True,
                     audio_out_enabled=True,
-                )
+                ),
+                "exotel": lambda: FastAPIWebsocketParams(
+                    audio_in_enabled=True,
+                    audio_out_enabled=True,
+                ),
             },
         )
 
@@ -619,21 +624,11 @@ async def bot(runner_args: RunnerArguments):
 # ============================================================================
 
 if __name__ == "__main__":
-    if config.DISABLE_TEST_CLIENT:
-        # Production mode: the browser test transport must not run.
-        # In Stage 3+ the Exotel WebSocket transport will be wired here instead.
-        # For now, fail loudly so it's obvious what's happening.
-        logger.error(
-            "DISABLE_TEST_CLIENT=true but no production transport is configured yet. "
-            "This will be implemented in Stage 3 when the Exotel WSS transport lands. "
-            "For now, either set DISABLE_TEST_CLIENT=false (dev mode) or wait for Stage 3."
-        )
-        sys.exit(1)
+    import os as _os
 
-    # Dev mode: start the SmallWebRTC test runner.
-    # pipecat's runner creates SmallWebRTCRequestHandler with no ice_servers, so
-    # the server only generates Docker-internal IP candidates. Patch the class
-    # before main() calls _setup_webrtc_routes so the handler gets Google STUN.
+    # STUN patch — injects Google STUN into the WebRTC handler so the server
+    # emits server-reflexive candidates instead of only Docker-internal ones.
+    # Harmless when running --transport exotel (the patched class is never used).
     import pipecat.transports.smallwebrtc.request_handler as _rh
     from pipecat.transports.smallwebrtc.connection import IceServer as _IceServer
     _OrigHandler = _rh.SmallWebRTCRequestHandler
@@ -645,6 +640,12 @@ if __name__ == "__main__":
             super().__init__(ice_servers=ice_servers, **kwargs)
 
     _rh.SmallWebRTCRequestHandler = _STUNRequestHandler
+
+    # If PIPECAT_PROXY env var is set (production), inject --proxy into argv so
+    # pipecat's runner includes it in Exotel WebSocket URL responses.
+    _proxy = _os.environ.get("PIPECAT_PROXY", "").strip()
+    if _proxy and "--proxy" not in sys.argv:
+        sys.argv.extend(["--proxy", _proxy])
 
     from pipecat.runner.run import main
     main()

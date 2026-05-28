@@ -105,7 +105,8 @@ services:
     image: voice-agent:latest
     # Pipecat's runner reads --host/--port from CLI args, not env vars.
     # 0.0.0.0 binds inside the container; Docker maps the port externally.
-    command: ["python", "-m", "app.main", "--host", "0.0.0.0", "--port", "7860"]
+    # Transport: webrtc (dev) or exotel (production). Set PIPECAT_TRANSPORT in .env.
+    command: ["python", "-m", "app.main", "--host", "0.0.0.0", "--port", "7860", "--transport", "${PIPECAT_TRANSPORT:-webrtc}"]
     restart: unless-stopped
     env_file:
       - .env
