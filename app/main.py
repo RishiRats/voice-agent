@@ -50,6 +50,7 @@ from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.transports.base_transport import TransportParams
+from pipecat.transcriptions.language import Language
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.llm_service import FunctionCallParams
@@ -212,7 +213,7 @@ async def build_pipeline_for_call(
         sample_rate=16000,
         settings=SarvamSTTService.Settings(
             model="saaras:v3",
-            language=tenant.default_language,
+            language=None,  # auto-detect: saaras:v3 defaults to "unknown" → multilingual
         ),
     )
 
@@ -256,10 +257,10 @@ async def build_pipeline_for_call(
         settings=SarvamTTSService.Settings(
             model="bulbul:v3",
             voice=tenant.voice,
-            language=tenant.default_language,
-            temperature=0.6,
-            pace=1.0,
-        ),
+            language=Language.EN_IN,  # en-IN: Bulbul v3 is multilingual — handles
+            temperature=0.6,          # English natively and still speaks Hindi/Marathi
+            pace=1.0,                 # Devanagari text. hi-IN was forcing Hindi phonetics
+        ),                            # even for English responses.
     )
 
     # ----- Tools -----
@@ -378,7 +379,6 @@ async def build_pipeline_for_call(
         stt,
         context_aggregator.user(),
         llm,
-        HindiTTSGuard(),  # prepends "जी, " to pure-English chunks so Sarvam TTS accepts them
         tts,
         transport.output(),
         context_aggregator.assistant(),
