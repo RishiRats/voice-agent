@@ -134,7 +134,7 @@ def _render_appointments(rows: list) -> str:
             f'<td class="py-2 pr-4 font-medium text-gray-800 whitespace-nowrap">{_fmt_dt(r["slot_at"])}</td>'
             f'<td class="py-2 pr-4 text-gray-700">{_e(r["caller_name"])}</td>'
             f'<td class="py-2 pr-4 text-gray-600 whitespace-nowrap">{_e(r["caller_phone"])}</td>'
-            f'<td class="py-2 pr-4 text-gray-500 max-w-xs truncate">{_e(r["notes"])}</td>'
+            f'<td class="py-2 pr-4 text-gray-500">{_e(r["notes"])}</td>'
             f'<td class="py-2 pr-4">{_status_badge(r["status"])}</td>'
             f'<td class="py-2">{cancel_btn}</td>'
             f"</tr>"
@@ -156,7 +156,7 @@ def _render_logs(rows: list) -> str:
             f'<td class="py-2 pr-4 text-gray-700 whitespace-nowrap">{caller}</td>'
             f'<td class="py-2 pr-4 text-gray-500">{dur}</td>'
             f'<td class="py-2 pr-4">{_outcome_badge(r["outcome"])}</td>'
-            f'<td class="py-2 text-gray-500 max-w-sm truncate" title="{summary}">{summary}</td>'
+            f'<td class="py-2 text-gray-500">{summary}</td>'
             f"</tr>"
         )
     return "\n".join(out)
