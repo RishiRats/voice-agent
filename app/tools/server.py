@@ -199,7 +199,7 @@ async def check_availability(request: Request, req: CheckAvailabilityRequest):
     ]
 
     return CheckAvailabilityResponse(
-        available_slots=open_slots[:4],
+        available_slots=open_slots[:3],
         date=req.date,
     )
 

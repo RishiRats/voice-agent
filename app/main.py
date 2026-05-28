@@ -647,5 +647,11 @@ if __name__ == "__main__":
     if _proxy and "--proxy" not in sys.argv:
         sys.argv.extend(["--proxy", _proxy])
 
+    # Mount the admin dashboard onto pipecat's FastAPI app before the runner
+    # starts the server. Routes: GET /admin, POST /admin/appointments, etc.
+    from pipecat.runner.run import app as _pipecat_app
+    from app.admin import router as _admin_router
+    _pipecat_app.include_router(_admin_router)
+
     from pipecat.runner.run import main
     main()

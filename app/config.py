@@ -54,3 +54,7 @@ TOOLS_INTERNAL_TOKEN = _require("TOOLS_INTERNAL_TOKEN")
 
 # Production flag. Set to 'true' to disable the browser /client test page.
 DISABLE_TEST_CLIENT = os.environ.get("DISABLE_TEST_CLIENT", "false").lower() == "true"
+
+# Admin dashboard password (HTTP Basic Auth, username: admin).
+# If not set, /admin returns 401 with a clear error.
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
