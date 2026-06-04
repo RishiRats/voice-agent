@@ -1,4 +1,4 @@
-"""Admin dashboard — view/manage appointments and call logs.
+"""Admin dashboard — view/manage appointments, call logs, and service catalog.
 
 Protected by HTTP Basic Auth (username: admin, password: ADMIN_TOKEN from .env).
 Access at: https://<your-domain>/admin
@@ -9,6 +9,7 @@ Mount this router on pipecat's FastAPI app before calling main():
     _pipecat_app.include_router(_admin_router)
 """
 import base64
+import json
 import secrets
 from datetime import date, datetime, timedelta, timezone
 
@@ -49,7 +50,7 @@ def _unauth() -> Response:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DB pool (separate from the agent pool so startup/shutdown are independent)
+# DB pool
 # ─────────────────────────────────────────────────────────────────────────────
 
 _pg: asyncpg.Pool | None = None
@@ -78,6 +79,7 @@ def _status_badge(status: str) -> str:
         "cancelled": "bg-red-100 text-red-700",
         "completed": "bg-green-100 text-green-700",
         "no_show":   "bg-yellow-100 text-yellow-700",
+        "pending":   "bg-orange-100 text-orange-700",
     }.get(status, "bg-gray-100 text-gray-700")
     return (
         f'<span class="inline-block px-2 py-0.5 rounded text-xs font-medium {cls}">'
@@ -100,7 +102,6 @@ def _outcome_badge(outcome: str | None) -> str:
 
 
 def _e(text: str | None) -> str:
-    """HTML-escape a string."""
     if text is None:
         return "—"
     return (
@@ -112,8 +113,20 @@ def _e(text: str | None) -> str:
     )
 
 
+def _price_display(min_paise: int | None, max_paise: int | None) -> str:
+    if min_paise is None:
+        return "Price on request"
+    if min_paise == 0 and (max_paise is None or max_paise == 0):
+        return "Free"
+    min_inr = min_paise // 100
+    max_inr = max_paise // 100 if max_paise is not None else None
+    if max_inr is not None and max_inr != min_inr:
+        return f"₹{min_inr:,}–₹{max_inr:,}"
+    return f"₹{min_inr:,}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# HTML rendering
+# HTML rendering — Appointments
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _render_appointments(rows: list) -> str:
@@ -142,6 +155,10 @@ def _render_appointments(rows: list) -> str:
     return "\n".join(out)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML rendering — Call logs
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _render_logs(rows: list) -> str:
     if not rows:
         return '<tr><td colspan="5" class="py-6 text-center text-gray-400 text-sm">No call logs yet.</td></tr>'
@@ -162,9 +179,47 @@ def _render_logs(rows: list) -> str:
     return "\n".join(out)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML rendering — Catalog
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_catalog_rows(rows: list) -> str:
+    if not rows:
+        return '<tr><td colspan="7" class="py-6 text-center text-gray-400 text-sm">No catalog items. Add one above.</td></tr>'
+    out = []
+    for r in rows:
+        avail_checked = "checked" if r["available"] else ""
+        price = _price_display(r["price_min_paise"], r["price_max_paise"])
+        dur = f"{r['duration_mins']} min"
+        out.append(
+            f'<tr class="hover:bg-gray-50" id="catalog-row-{r["id"]}">'
+            f'<td class="py-2 pr-3 font-medium text-gray-800">{_e(r["name"])}</td>'
+            f'<td class="py-2 pr-3 text-gray-500 text-xs">{_e(r["category"])}</td>'
+            f'<td class="py-2 pr-3 text-gray-700">{_e(price)}</td>'
+            f'<td class="py-2 pr-3 text-gray-500">{dur}</td>'
+            f'<td class="py-2 pr-3 text-gray-400 text-xs">{_e(r["description"])}</td>'
+            f'<td class="py-2 pr-3 text-center">'
+            f'  <input type="checkbox" {avail_checked} '
+            f'    onchange="toggleAvailable({r["id"]}, this.checked)"'
+            f'    class="w-4 h-4 cursor-pointer accent-green-600">'
+            f'</td>'
+            f'<td class="py-2">'
+            f'  <button onclick="deleteItem({r["id"]}, \'{_e(r["name"])}\')"'
+            f'    class="text-xs font-medium text-red-600 hover:text-red-800">Delete</button>'
+            f'</td>'
+            f"</tr>"
+        )
+    return "\n".join(out)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Full page
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _render_page(
     appt_rows: str,
     log_rows: str,
+    catalog_rows: str,
     tomorrow: str,
     msg: str = "",
 ) -> str:
@@ -172,18 +227,26 @@ def _render_page(
         f'<div class="mb-4 px-4 py-2 bg-green-100 text-green-800 rounded text-sm">{_e(msg)}</div>'
         if msg else ""
     )
+    # Embed TOOLS_INTERNAL_TOKEN in a meta tag for JS fetch calls.
+    # The admin page requires HTTP Basic Auth so this is only visible to authenticated operators.
+    # The tools server is bound to 127.0.0.1:8000 — not publicly reachable.
+    internal_token = _e(config.TOOLS_INTERNAL_TOKEN)
+    tools_base_url = _e(config.TOOLS_BASE_URL)
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="internal-token" content="{internal_token}">
+  <meta name="tools-base-url" content="{tools_base_url}">
   <title>Admin — Voice Agent</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-gray-100 min-h-screen font-sans">
 <div class="max-w-7xl mx-auto px-4 py-8">
 
-  <div class="flex items-center justify-between mb-8">
+  <div class="flex items-center justify-between mb-6">
     <div>
       <h1 class="text-2xl font-bold text-gray-900">Voice Agent Admin</h1>
       <p class="text-sm text-gray-500 mt-0.5">Sharma Dental Clinic &mdash; tenant #1 &mdash; times in IST</p>
@@ -202,7 +265,6 @@ def _render_page(
       </button>
     </div>
 
-    <!-- add form -->
     <div id="add-form" class="hidden px-6 py-4 bg-blue-50 border-b border-blue-100">
       <p class="text-xs font-semibold text-blue-600 uppercase tracking-wide mb-3">Manual entry</p>
       <form method="post" action="/admin/appointments"
@@ -260,6 +322,80 @@ def _render_page(
     </div>
   </div>
 
+  <!-- ── Service Catalog ────────────────────────────────────────── -->
+  <div class="bg-white rounded-xl shadow mb-6">
+    <div class="flex items-center justify-between px-6 pt-6 pb-4 border-b border-gray-100">
+      <h2 class="text-base font-semibold text-gray-800">Service Catalog</h2>
+      <button onclick="document.getElementById('catalog-add-form').classList.toggle('hidden')"
+              class="text-sm bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-lg font-medium">
+        + Add service
+      </button>
+    </div>
+
+    <!-- catalog add form -->
+    <div id="catalog-add-form" class="hidden px-6 py-4 bg-blue-50 border-b border-blue-100">
+      <p class="text-xs font-semibold text-blue-600 uppercase tracking-wide mb-3">New service</p>
+      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-3 items-end">
+        <div class="lg:col-span-2">
+          <label class="block text-xs text-gray-600 mb-1">Name *</label>
+          <input id="ci-name" type="text" placeholder="e.g. Consultation"
+                 class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400">
+        </div>
+        <div>
+          <label class="block text-xs text-gray-600 mb-1">Category</label>
+          <input id="ci-category" type="text" value="General"
+                 class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400">
+        </div>
+        <div>
+          <label class="block text-xs text-gray-600 mb-1">Price min (₹)</label>
+          <input id="ci-price-min" type="number" min="0" placeholder="0"
+                 class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400">
+        </div>
+        <div>
+          <label class="block text-xs text-gray-600 mb-1">Price max (₹)</label>
+          <input id="ci-price-max" type="number" min="0" placeholder="0"
+                 class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400">
+        </div>
+        <div>
+          <label class="block text-xs text-gray-600 mb-1">Duration (min)</label>
+          <input id="ci-duration" type="number" min="1" value="30"
+                 class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400">
+        </div>
+        <div>
+          <button onclick="addCatalogItem()"
+                  class="w-full bg-green-600 hover:bg-green-700 text-white rounded px-3 py-1.5 text-sm font-medium">
+            Add
+          </button>
+        </div>
+      </div>
+      <div class="mt-2">
+        <label class="block text-xs text-gray-600 mb-1">Description (optional)</label>
+        <input id="ci-description" type="text" placeholder="Short description shown to Priya"
+               class="w-full border border-gray-300 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400">
+      </div>
+      <p id="catalog-add-error" class="text-red-600 text-xs mt-2 hidden"></p>
+    </div>
+
+    <div class="px-6 py-4 overflow-x-auto">
+      <table class="w-full text-sm" id="catalog-table">
+        <thead>
+          <tr class="text-left text-xs font-medium text-gray-500 border-b border-gray-200">
+            <th class="pb-2 pr-4">Service</th>
+            <th class="pb-2 pr-4">Category</th>
+            <th class="pb-2 pr-4">Price</th>
+            <th class="pb-2 pr-4">Duration</th>
+            <th class="pb-2 pr-4">Description</th>
+            <th class="pb-2 pr-4 text-center">Active</th>
+            <th class="pb-2">Action</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-gray-50" id="catalog-tbody">
+          {catalog_rows}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- ── Call Logs ─────────────────────────────────────────────── -->
   <div class="bg-white rounded-xl shadow">
     <div class="px-6 pt-6 pb-4 border-b border-gray-100">
@@ -284,6 +420,70 @@ def _render_page(
   </div>
 
 </div>
+
+<script>
+const TENANT_ID = 1;
+const TOKEN = document.querySelector('meta[name="internal-token"]').content;
+const TOOLS_URL = document.querySelector('meta[name="tools-base-url"]').content;
+
+async function apiCatalog(method, path, body) {{
+  const opts = {{
+    method,
+    headers: {{'Content-Type': 'application/json', 'X-Internal-Token': TOKEN}},
+  }};
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  return fetch(TOOLS_URL + path, opts);
+}}
+
+async function toggleAvailable(itemId, checked) {{
+  const r = await apiCatalog('PATCH', `/admin/catalog/${{itemId}}?tenant_id=${{TENANT_ID}}`, {{available: checked}});
+  if (!r.ok) alert('Failed to update availability');
+}}
+
+async function deleteItem(itemId, name) {{
+  if (!confirm('Delete "' + name + '"?')) return;
+  const r = await apiCatalog('DELETE', `/admin/catalog/${{itemId}}?tenant_id=${{TENANT_ID}}`);
+  if (r.ok) {{
+    document.getElementById('catalog-row-' + itemId)?.remove();
+  }} else {{
+    alert('Delete failed');
+  }}
+}}
+
+async function addCatalogItem() {{
+  const name = document.getElementById('ci-name').value.trim();
+  const category = document.getElementById('ci-category').value.trim() || 'General';
+  const priceMinRaw = document.getElementById('ci-price-min').value;
+  const priceMaxRaw = document.getElementById('ci-price-max').value;
+  const duration = parseInt(document.getElementById('ci-duration').value) || 30;
+  const description = document.getElementById('ci-description').value.trim() || null;
+  const errEl = document.getElementById('catalog-add-error');
+
+  // Client-side validation
+  if (!name) {{ errEl.textContent = 'Name is required.'; errEl.classList.remove('hidden'); return; }}
+  if (duration <= 0) {{ errEl.textContent = 'Duration must be > 0.'; errEl.classList.remove('hidden'); return; }}
+
+  const priceMin = priceMinRaw !== '' ? Math.round(parseFloat(priceMinRaw) * 100) : null;
+  const priceMax = priceMaxRaw !== '' ? Math.round(parseFloat(priceMaxRaw) * 100) : null;
+  if (priceMin !== null && priceMax !== null && priceMax < priceMin) {{
+    errEl.textContent = 'Price max must be ≥ price min.'; errEl.classList.remove('hidden'); return;
+  }}
+
+  errEl.classList.add('hidden');
+  const r = await apiCatalog('POST', '/admin/catalog', {{
+    tenant_id: TENANT_ID, name, description, category,
+    price_min_paise: priceMin, price_max_paise: priceMax, duration_mins: duration
+  }});
+
+  if (r.ok) {{
+    window.location.reload();
+  }} else {{
+    const data = await r.json().catch(() => ({{}}));
+    errEl.textContent = data.detail || 'Failed to add service.';
+    errEl.classList.remove('hidden');
+  }}
+}}
+</script>
 </body>
 </html>"""
 
@@ -321,11 +521,22 @@ async def admin_page(request: Request, msg: str = ""):
         """,
         config.DEMO_TENANT_ID,
     )
+    catalog = await pool.fetch(
+        """
+        SELECT id, name, description, category,
+               price_min_paise, price_max_paise, duration_mins, available
+        FROM catalog_items
+        WHERE tenant_id = $1
+        ORDER BY category, display_order, name
+        """,
+        config.DEMO_TENANT_ID,
+    )
 
     tomorrow = (date.today() + timedelta(days=1)).isoformat()
     html = _render_page(
         appt_rows=_render_appointments(list(appts)),
         log_rows=_render_logs(list(logs)),
+        catalog_rows=_render_catalog_rows(list(catalog)),
         tomorrow=tomorrow,
         msg=msg,
     )
