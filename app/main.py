@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 import asyncpg
 import httpx
 from dotenv import load_dotenv
+from fastapi import Request
 from loguru import logger
 
 from pipecat.pipeline.pipeline import Pipeline
@@ -646,17 +647,20 @@ def _check_payment_auth(request) -> bool:
         return False
 
 
-async def get_pending_payments(request):
+async def get_pending_payments(request: Request):
     from fastapi.responses import JSONResponse, Response
     if not _check_payment_auth(request):
         return Response(
             "Unauthorized", status_code=401,
             headers={"WWW-Authenticate": 'Basic realm="Voice Agent Admin"'},
         )
-    return JSONResponse(list(_pending_payments.values()))
+    # Return most-recent pending payment first so /payment-test auto-discovers
+    # it without needing a call_id URL param.
+    items = sorted(_pending_payments.values(), key=lambda p: p.get("call_id", ""), reverse=True)
+    return JSONResponse(items)
 
 
-async def confirm_payment_result(request):
+async def confirm_payment_result(request: Request):
     from fastapi.responses import JSONResponse, Response
     if not _check_payment_auth(request):
         return Response(
@@ -692,7 +696,7 @@ async def confirm_payment_result(request):
     return JSONResponse({"ok": True})
 
 
-async def payment_test_page(request):
+async def payment_test_page(request: Request):
     from fastapi.responses import HTMLResponse, Response
     if not _check_payment_auth(request):
         return Response(
