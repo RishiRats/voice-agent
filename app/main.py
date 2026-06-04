@@ -74,6 +74,7 @@ from app import config
 from app.services.tenant_loader import load_tenant_by_id, Tenant
 from app.services.redis_memory import append_turns_bulk
 from app.services.log_redact import redact_phone, redact_name
+from app.services.catalog_loader import build_system_prompt_with_catalog
 
 load_dotenv()
 
@@ -183,7 +184,8 @@ _ALL_TOOL_SCHEMAS: dict[str, FunctionSchema] = {
         description=(
             "Book a confirmed appointment slot. "
             "NEVER call without: (1) caller chose a specific slot you just offered, "
-            "(2) caller's full name, (3) caller's 10-digit phone number in E.164 (+91XXXXXXXXXX)."
+            "(2) caller's full name, (3) caller's 10-digit phone number in E.164 (+91XXXXXXXXXX), "
+            "(4) service_name exactly as listed in the SERVICES & PRICING section."
         ),
         properties={
             "slot": {
@@ -195,12 +197,16 @@ _ALL_TOOL_SCHEMAS: dict[str, FunctionSchema] = {
                 "type": "string",
                 "description": "+91XXXXXXXXXX format",
             },
+            "service_name": {
+                "type": "string",
+                "description": "The name of the service being booked, exactly as listed in the catalog.",
+            },
             "notes": {
                 "type": "string",
-                "description": "Optional reason for visit",
+                "description": "Optional additional reason for visit",
             },
         },
-        required=["slot", "caller_name", "caller_phone"],
+        required=["slot", "caller_name", "caller_phone", "service_name"],
     ),
     "confirm_payment": FunctionSchema(
         name="confirm_payment",
@@ -228,6 +234,7 @@ async def build_pipeline_for_call(
     tenant: Tenant,
     call_id: str,
     tool_call_log: list[dict],
+    pool: asyncpg.Pool,
 ) -> tuple[PipelineTask, LLMContext]:
     """Construct a Pipecat pipeline customized for this tenant."""
 
@@ -356,6 +363,7 @@ async def build_pipeline_for_call(
             "slot": args.get("slot"),
             "caller_name": args.get("caller_name"),
             "caller_phone": caller_phone,
+            "service_name": args.get("service_name"),
             "notes": args.get("notes"),
         }
         logger.info(
@@ -498,8 +506,12 @@ async def build_pipeline_for_call(
         llm.register_function("confirm_payment", handle_confirm_payment)
 
     # ----- Conversation context -----
+    # Catalog replaces any hardcoded SERVICES section in the base prompt
+    system_prompt = await build_system_prompt_with_catalog(
+        tenant.system_prompt, pool, tenant.id
+    )
     today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
-    system_with_date = tenant.system_prompt + f"\n\nToday is {today} (IST)."
+    system_with_date = system_prompt + f"\n\nToday is {today} (IST)."
     context = LLMContext(
         messages=[{"role": "system", "content": system_with_date}],
         tools=tools_schema,
@@ -835,7 +847,7 @@ async def bot(runner_args: RunnerArguments):
             },
         )
 
-        task, context = await build_pipeline_for_call(transport, tenant, call_id, tool_call_log)
+        task, context = await build_pipeline_for_call(transport, tenant, call_id, tool_call_log, pool)
 
         # Register task so payment dialog can inject frames into this call
         _active_tasks[call_id] = task
