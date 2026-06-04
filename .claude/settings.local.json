@@ -67,7 +67,23 @@
       "Bash(podman-compose -f docker-compose.yaml up -d)",
       "Bash(podman-compose -f docker-compose.yaml down)",
       "Bash(podman logs *)",
-      "Bash(podman images *)"
+      "Bash(podman images *)",
+      "Bash(ssh voice-agent *)",
+      "Bash(ssh -v voice-agent \"echo connected\")",
+      "Bash(gcloud compute instances list *)",
+      "Bash(ssh-keygen -R 35.207.230.54)",
+      "Bash(ssh -o StrictHostKeyChecking=accept-new voice-agent \"echo connected && hostname\")",
+      "Bash(gcloud compute firewall-rules list *)",
+      "Bash(gcloud compute instances describe instance-20260527-195847 *)",
+      "Bash(gcloud compute firewall-rules create allow-webrtc-udp *)",
+      "Bash(gcloud compute addresses create voice-agent-ip *)",
+      "Bash(gcloud compute addresses describe voice-agent-ip *)",
+      "Bash(gcloud compute *)",
+      "Bash(ssh-keygen -R 35.207.204.34)",
+      "Bash(ssh -o StrictHostKeyChecking=accept-new voice-agent \"echo 'SSH OK' && curl -sk https://localhost/client/ -o /dev/null -w 'HTTPS: %{http_code}\\\\n'\")",
+      "Bash(git *)",
+      "Bash(docker compose *)",
+      "Bash(docker-compose ps *)"
     ]
   }
 }
