@@ -476,6 +476,177 @@ async def cancel_expired_payments(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Catalog admin CRUD — scoped to tenant (cross-tenant protection enforced)
+# ---------------------------------------------------------------------------
+
+# Allowed update fields — used to prevent dynamic SQL injection via field names
+_CATALOG_UPDATE_FIELDS = frozenset({
+    "name", "description", "category",
+    "price_min_paise", "price_max_paise",
+    "duration_mins", "available", "display_order",
+})
+
+
+class CatalogItemCreate(BaseModel):
+    tenant_id: int
+    name: str
+    description: str | None = None
+    category: str = "General"
+    price_min_paise: int | None = None
+    price_max_paise: int | None = None
+    duration_mins: int = 30
+    display_order: int = 0
+
+    @field_validator("name")
+    @classmethod
+    def name_not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("name cannot be empty")
+        return v.strip()
+
+    @field_validator("price_min_paise", "price_max_paise", mode="before")
+    @classmethod
+    def price_non_negative(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("price cannot be negative")
+        return v
+
+    @field_validator("duration_mins")
+    @classmethod
+    def duration_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("duration must be positive")
+        return v
+
+
+class CatalogItemUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    category: str | None = None
+    price_min_paise: int | None = None
+    price_max_paise: int | None = None
+    duration_mins: int | None = None
+    available: bool | None = None
+    display_order: int | None = None
+
+
+@app.get("/admin/catalog",
+         dependencies=[Depends(require_internal_token)])
+@limiter.limit("60/minute")
+async def list_catalog(request: Request, tenant_id: int):
+    pool = await get_pg_pool()
+    rows = await pool.fetch(
+        """
+        SELECT id, name, description, category,
+               price_min_paise, price_max_paise,
+               duration_mins, available, display_order,
+               created_at, updated_at
+        FROM catalog_items
+        WHERE tenant_id = $1
+        ORDER BY category, display_order, name
+        """,
+        tenant_id,
+    )
+    return {"items": [dict(r) for r in rows]}
+
+
+@app.post("/admin/catalog",
+          dependencies=[Depends(require_internal_token)])
+@limiter.limit("30/minute")
+async def create_catalog_item(request: Request, body: CatalogItemCreate):
+    if (body.price_min_paise is not None and
+            body.price_max_paise is not None and
+            body.price_max_paise < body.price_min_paise):
+        raise HTTPException(
+            status_code=422,
+            detail="price_max_paise must be >= price_min_paise",
+        )
+    pool = await get_pg_pool()
+    item_id = await pool.fetchval(
+        """
+        INSERT INTO catalog_items
+          (tenant_id, name, description, category,
+           price_min_paise, price_max_paise,
+           duration_mins, display_order)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        RETURNING id
+        """,
+        body.tenant_id, body.name, body.description,
+        body.category, body.price_min_paise, body.price_max_paise,
+        body.duration_mins, body.display_order,
+    )
+    logger.info(f"Catalog item created: id={item_id} tenant={body.tenant_id} name={body.name!r}")
+    return {"created": True, "id": item_id}
+
+
+@app.patch("/admin/catalog/{item_id}",
+           dependencies=[Depends(require_internal_token)])
+@limiter.limit("30/minute")
+async def update_catalog_item(
+    request: Request,
+    item_id: int,
+    tenant_id: int,
+    body: CatalogItemUpdate,
+):
+    pool = await get_pg_pool()
+    owner = await pool.fetchval(
+        "SELECT tenant_id FROM catalog_items WHERE id = $1", item_id
+    )
+    if owner is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+    if owner != tenant_id:
+        logger.warning(
+            f"Cross-tenant catalog access attempt: "
+            f"item {item_id} belongs to tenant {owner}, request from tenant {tenant_id}"
+        )
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    updates = {k: v for k, v in body.model_dump(exclude_none=True).items()
+               if k in _CATALOG_UPDATE_FIELDS}
+    if not updates:
+        raise HTTPException(status_code=422, detail="No fields to update")
+
+    # Validate price range if both provided in this update
+    new_min = updates.get("price_min_paise")
+    new_max = updates.get("price_max_paise")
+    if new_min is not None and new_max is not None and new_max < new_min:
+        raise HTTPException(status_code=422, detail="price_max_paise must be >= price_min_paise")
+
+    set_clauses = [f"{key} = ${i}" for i, key in enumerate(updates.keys(), start=1)]
+    values = list(updates.values())
+    values.append(item_id)
+
+    await pool.execute(
+        f"UPDATE catalog_items SET {', '.join(set_clauses)} WHERE id = ${len(values)}",
+        *values,
+    )
+    logger.info(f"Catalog item updated: id={item_id} tenant={tenant_id} fields={list(updates.keys())}")
+    return {"updated": True, "id": item_id}
+
+
+@app.delete("/admin/catalog/{item_id}",
+            dependencies=[Depends(require_internal_token)])
+@limiter.limit("30/minute")
+async def delete_catalog_item(request: Request, item_id: int, tenant_id: int):
+    pool = await get_pg_pool()
+    owner = await pool.fetchval(
+        "SELECT tenant_id FROM catalog_items WHERE id = $1", item_id
+    )
+    if owner is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+    if owner != tenant_id:
+        logger.warning(
+            f"Cross-tenant delete attempt: item {item_id} owned by {owner}, "
+            f"request from tenant {tenant_id}"
+        )
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    await pool.execute("DELETE FROM catalog_items WHERE id = $1", item_id)
+    logger.info(f"Catalog item deleted: id={item_id} tenant={tenant_id}")
+    return {"deleted": True, "id": item_id}
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
