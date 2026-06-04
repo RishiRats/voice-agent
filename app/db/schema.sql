@@ -204,6 +204,9 @@ CREATE TABLE IF NOT EXISTS catalog_items (
 CREATE INDEX IF NOT EXISTS idx_catalog_tenant_available
   ON catalog_items (tenant_id, available, category, display_order);
 
+ALTER TABLE catalog_items
+  ADD CONSTRAINT IF NOT EXISTS uq_catalog_tenant_name UNIQUE (tenant_id, name);
+
 CREATE OR REPLACE FUNCTION touch_catalog_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN NEW.updated_at = now(); RETURN NEW; END;
