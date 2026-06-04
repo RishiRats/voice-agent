@@ -204,6 +204,7 @@ class BookAppointmentRequest(BaseModel):
     slot: str  # ISO datetime e.g. "2026-05-28T11:30:00"
     caller_name: str
     caller_phone: str
+    service_name: str | None = None
     notes: str | None = None
 
     @field_validator("slot")
@@ -223,6 +224,8 @@ class BookAppointmentResponse(BaseModel):
     reason: str | None = None
     payment_required: bool = False
     payment_amount_paise: int | None = None
+    service_name: str | None = None
+    service_duration_mins: int = 30
 
 
 @app.post("/tools/book_appointment", response_model=BookAppointmentResponse,
@@ -232,7 +235,7 @@ async def book_appointment(request: Request, req: BookAppointmentRequest):
     slot_dt = datetime.fromisoformat(req.slot)
     pool = await get_pg_pool()
 
-    # Fetch tenant payment config alongside the booking
+    # Fetch tenant payment config
     tenant_row = await pool.fetchrow(
         "SELECT payment_enabled, payment_amount_paise, payment_expiry_hours FROM tenants WHERE id = $1",
         req.tenant_id,
@@ -241,6 +244,32 @@ async def book_appointment(request: Request, req: BookAppointmentRequest):
         raise HTTPException(status_code=404, detail="tenant not found")
 
     payment_enabled = tenant_row["payment_enabled"]
+
+    # Look up service from catalog — drives duration and payment amount
+    service_item = None
+    if req.service_name:
+        service_item = await pool.fetchrow(
+            """
+            SELECT id, name, price_min_paise, price_max_paise, duration_mins
+            FROM catalog_items
+            WHERE tenant_id = $1 AND available = true AND name ILIKE $2
+            LIMIT 1
+            """,
+            req.tenant_id,
+            req.service_name,
+        )
+        if not service_item:
+            logger.warning(
+                f"Service not found in catalog: {req.service_name!r} "
+                f"tenant={req.tenant_id} — proceeding with default 30min slot"
+            )
+
+    duration_mins = service_item["duration_mins"] if service_item else 30
+    payment_amount = (
+        service_item["price_min_paise"]
+        if service_item and service_item["price_min_paise"] is not None
+        else tenant_row["payment_amount_paise"]
+    )
 
     try:
         async with pool.acquire() as conn:
@@ -273,8 +302,9 @@ async def book_appointment(request: Request, req: BookAppointmentRequest):
                     INSERT INTO appointments
                       (tenant_id, call_id, caller_name, caller_phone,
                        slot_at, notes, status,
-                       payment_status, payment_expires_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                       payment_status, payment_expires_at,
+                       service_name, service_duration_mins)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                     RETURNING id, slot_at
                     """,
                     req.tenant_id,
@@ -286,6 +316,8 @@ async def book_appointment(request: Request, req: BookAppointmentRequest):
                     initial_status,
                     payment_status,
                     payment_expires_at,
+                    req.service_name,
+                    duration_mins,
                 )
     except asyncpg.exceptions.UniqueViolationError:
         return BookAppointmentResponse(success=False, reason="slot_taken")
@@ -293,7 +325,8 @@ async def book_appointment(request: Request, req: BookAppointmentRequest):
     logger.info(
         f"APPOINTMENT: id={row['id']} tenant={req.tenant_id} "
         f"name={redact_name(req.caller_name)} phone={redact_phone(req.caller_phone)} "
-        f"slot={row['slot_at'].isoformat()} status={initial_status} payment={payment_status}"
+        f"slot={row['slot_at'].isoformat()} status={initial_status} payment={payment_status} "
+        f"service={req.service_name!r} duration={duration_mins}min"
     )
 
     return BookAppointmentResponse(
@@ -301,7 +334,9 @@ async def book_appointment(request: Request, req: BookAppointmentRequest):
         appointment_id=row["id"],
         confirmed_slot=row["slot_at"].isoformat(),
         payment_required=payment_enabled,
-        payment_amount_paise=tenant_row["payment_amount_paise"],
+        payment_amount_paise=payment_amount,
+        service_name=req.service_name,
+        service_duration_mins=duration_mins,
     )
 
 
