@@ -368,6 +368,11 @@ async def confirm_payment(request: Request, body: ConfirmPaymentRequest):
         )
         return ConfirmPaymentResponse(appointment_status="booked", payment_status="paid")
     else:
+        await pool.execute(
+            "UPDATE appointments SET payment_status = 'failed' WHERE id = $1 AND tenant_id = $2",
+            body.appointment_id,
+            body.tenant_id,
+        )
         logger.info(
             f"Payment failed: appointment_id={body.appointment_id} tenant={body.tenant_id}"
         )
