@@ -207,3 +207,41 @@ WHERE id = 1;
 INSERT INTO trusted_callers (tenant_id, phone, name, notes)
 VALUES (1, '+919999999999', 'Test Trusted', 'seeded for dev testing')
 ON CONFLICT (tenant_id, phone) DO NOTHING;
+
+-- Sharma Dental service catalog
+INSERT INTO catalog_items
+  (tenant_id, name, description, category,
+   price_min_paise, price_max_paise, duration_mins, display_order)
+VALUES
+  (1, 'Consultation',
+   'General dental examination with Dr. Sharma',
+   'General', 50000, 50000, 30, 1),
+
+  (1, 'Scaling & Polishing',
+   'Professional teeth cleaning and polishing',
+   'General', 150000, 200000, 45, 2),
+
+  (1, 'Tooth Filling',
+   'Composite resin or amalgam filling',
+   'General', 100000, 300000, 60, 3),
+
+  (1, 'Root Canal Treatment',
+   'Single or multi-sitting RCT. Price depends on tooth complexity.',
+   'General', 400000, 800000, 90, 4),
+
+  (1, 'Tooth Extraction',
+   'Simple extraction',
+   'General', 50000, 200000, 30, 5),
+
+  (1, 'Teeth Whitening',
+   'In-office laser whitening session',
+   'Cosmetic', 600000, 600000, 60, 6),
+
+  (1, 'Braces Consultation',
+   'Initial orthodontic assessment with Dr. Mehta. Tuesdays and Thursdays only.',
+   'Orthodontics', 0, 0, 30, 7),
+
+  (1, 'Full Braces Treatment',
+   'Complete orthodontic treatment. Price varies by case complexity.',
+   'Orthodontics', 4000000, 8000000, 60, 8)
+ON CONFLICT DO NOTHING;

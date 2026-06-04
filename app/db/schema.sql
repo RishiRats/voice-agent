@@ -174,3 +174,51 @@ BEGIN
         ('appointments', appts_deleted);
 END;
 $$ LANGUAGE plpgsql;
+
+
+-- =============================================================================
+-- CATALOG (migration 004) — service catalog per tenant
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS catalog_items (
+    id              BIGSERIAL PRIMARY KEY,
+    tenant_id       BIGINT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    name            TEXT NOT NULL,
+    description     TEXT,
+    category        TEXT NOT NULL DEFAULT 'General',
+    price_min_paise INTEGER CHECK (price_min_paise >= 0),
+    price_max_paise INTEGER CHECK (price_max_paise >= 0),
+    duration_mins   INTEGER NOT NULL DEFAULT 30 CHECK (duration_mins > 0),
+    available       BOOLEAN NOT NULL DEFAULT true,
+    display_order   INTEGER NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT name_not_empty CHECK (char_length(trim(name)) > 0),
+    CONSTRAINT price_range_valid CHECK (
+        price_max_paise IS NULL OR
+        price_min_paise IS NULL OR
+        price_max_paise >= price_min_paise
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_catalog_tenant_available
+  ON catalog_items (tenant_id, available, category, display_order);
+
+CREATE OR REPLACE FUNCTION touch_catalog_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN NEW.updated_at = now(); RETURN NEW; END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_catalog_updated_at ON catalog_items;
+CREATE TRIGGER trg_catalog_updated_at
+  BEFORE UPDATE ON catalog_items
+  FOR EACH ROW EXECUTE FUNCTION touch_catalog_updated_at();
+
+
+-- =============================================================================
+-- APPOINTMENT SERVICE FIELDS (migration 005)
+-- =============================================================================
+
+ALTER TABLE appointments
+  ADD COLUMN IF NOT EXISTS service_name          TEXT,
+  ADD COLUMN IF NOT EXISTS service_duration_mins INTEGER;
