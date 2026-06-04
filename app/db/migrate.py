@@ -1,10 +1,8 @@
-"""Run schema + seed against Postgres.
+"""Run schema + incremental migrations + seed against Postgres.
 
 Run with:   python -m app.db.migrate
 
-Idempotent: safe to run repeatedly. CREATE TABLE IF NOT EXISTS and the
-ON CONFLICT clause in seed.sql mean re-runs just update the demo tenant
-in place rather than failing.
+Idempotent: safe to run repeatedly. All DDL uses IF NOT EXISTS / ADD COLUMN IF NOT EXISTS.
 """
 import asyncio
 import os
@@ -19,6 +17,7 @@ load_dotenv()
 
 SCHEMA_FILE = Path(__file__).parent / "schema.sql"
 SEED_FILE = Path(__file__).parent / "seed.sql"
+MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
 
 async def migrate():
@@ -33,10 +32,15 @@ async def migrate():
         logger.info(f"Applying schema from {SCHEMA_FILE}")
         await conn.execute(SCHEMA_FILE.read_text())
 
+        # Apply numbered migration files in order (all use IF NOT EXISTS — idempotent)
+        migration_files = sorted(MIGRATIONS_DIR.glob("*.sql"))
+        for mf in migration_files:
+            logger.info(f"Applying migration {mf.name}")
+            await conn.execute(mf.read_text())
+
         logger.info(f"Seeding demo tenant from {SEED_FILE}")
         await conn.execute(SEED_FILE.read_text())
 
-        # Verify
         rows = await conn.fetch("SELECT id, name, inbound_did FROM tenants ORDER BY id")
         logger.info(f"Tenants now in database ({len(rows)}):")
         for r in rows:

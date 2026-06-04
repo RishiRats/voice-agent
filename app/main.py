@@ -22,9 +22,17 @@ Stage 2 additions over Stage 1:
 - Redis: full turn history mirrored to call:{call_id}:messages (written at disconnect).
 - call_logs: one row per call, with transcript, outcome, tool_calls, and async summary.
 - call_id: generated per connection; passed to tool handlers and stored in appointments.
+
+Payment mock (Stage 4 prep):
+- When tenant.payment_enabled, book_appointment returns payment_required=True.
+- Pipeline waits for operator to confirm via /payment-test browser page.
+- LLMMessagesAppendFrame injects the result as a SYSTEM message into the active pipeline.
+- LLM calls confirm_payment tool which finalises the appointment status.
 """
 import asyncio
+import base64
 import json
+import secrets
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -39,7 +47,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
-from pipecat.frames.frames import EndFrame, Frame, TextFrame
+from pipecat.frames.frames import EndFrame, Frame, TextFrame, LLMMessagesAppendFrame
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.processors.aggregators.llm_response_universal import (
@@ -69,7 +77,6 @@ from app.services.log_redact import redact_phone, redact_name
 
 load_dotenv()
 
-# Configure loguru
 logger.remove()
 logger.add(sys.stderr, level=config.LOG_LEVEL,
            format="<green>{time:HH:mm:ss.SSS}</green> | <level>{level:<8}</level> | {message}")
@@ -77,7 +84,6 @@ logger.add(sys.stderr, level=config.LOG_LEVEL,
 
 # ============================================================================
 # Auth header sent on every outbound request to the tools API.
-# The value is loaded once at startup from config; handlers reference this dict.
 # ============================================================================
 
 _INTERNAL_HEADERS = {
@@ -87,17 +93,25 @@ _INTERNAL_HEADERS = {
 
 # ============================================================================
 # Cost-protection: concurrent-call limiter.
-# Every active conversation consumes paid API quota (Gemini, Sarvam).
-# This cap means even an attacker with the WSS URL cannot spin up more than
-# MAX_CONCURRENT_CALLS simultaneous pipelines.
 # ============================================================================
 
 _concurrency_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_CALLS)
-_active_calls = 0  # for logging/observability only
+_active_calls = 0
 
 
 # ============================================================================
-# Postgres connection pool — shared across all in-flight calls.
+# Payment state — active tasks and pending payment dialogs.
+# _active_tasks: call_id → PipelineTask (for injecting frames)
+# _pending_payments: call_id → {appointment_id, amount_inr, is_trusted, caller_phone}
+# Both are plain dicts: asyncio is single-threaded so no locking needed.
+# ============================================================================
+
+_active_tasks: dict[str, PipelineTask] = {}
+_pending_payments: dict[str, dict] = {}
+
+
+# ============================================================================
+# Postgres connection pool
 # ============================================================================
 
 _pg_pool: asyncpg.Pool | None = None
@@ -116,10 +130,8 @@ async def get_pg_pool() -> asyncpg.Pool:
 
 
 # ============================================================================
-# HindiTTSGuard — ensures every text chunk sent to Sarvam TTS contains at
-# least one Devanagari character. Sarvam Bulbul (language=hi-IN) rejects
-# pure-English chunks with a 400 error. A Mumbai receptionist naturally
-# prefixes most English sentences with "जी," anyway, so this is unobtrusive.
+# HindiTTSGuard — kept for reference but not inserted into pipeline.
+# TTS is now set to en-IN which handles Devanagari natively.
 # ============================================================================
 
 _DEVANAGARI_RANGE = range(0x0900, 0x0980)
@@ -145,6 +157,7 @@ class HindiTTSGuard(FrameProcessor):
 # ============================================================================
 # Available tools — all tools the system knows about.
 # Filtered by tenant.tools_enabled before being passed to the LLM.
+# confirm_payment is added automatically when tenant.payment_enabled is True.
 # ============================================================================
 
 _ALL_TOOL_SCHEMAS: dict[str, FunctionSchema] = {
@@ -189,6 +202,20 @@ _ALL_TOOL_SCHEMAS: dict[str, FunctionSchema] = {
         },
         required=["slot", "caller_name", "caller_phone"],
     ),
+    "confirm_payment": FunctionSchema(
+        name="confirm_payment",
+        description=(
+            "Call this ONLY after a SYSTEM message arrives with the payment result. "
+            "Pass payment_success=true if payment completed, false if it failed or timed out."
+        ),
+        properties={
+            "payment_success": {
+                "type": "boolean",
+                "description": "True if payment was confirmed, False if failed or abandoned",
+            },
+        },
+        required=["payment_success"],
+    ),
 }
 
 
@@ -214,7 +241,7 @@ async def build_pipeline_for_call(
         sample_rate=16000,
         settings=SarvamSTTService.Settings(
             model="saaras:v3",
-            language=None,  # auto-detect: saaras:v3 defaults to "unknown" → multilingual
+            language=None,
         ),
     )
 
@@ -258,10 +285,10 @@ async def build_pipeline_for_call(
         settings=SarvamTTSService.Settings(
             model="bulbul:v3",
             voice=tenant.voice,
-            language=Language.EN_IN,  # en-IN: Bulbul v3 is multilingual — handles
-            temperature=0.6,          # English natively and still speaks Hindi/Marathi
-            pace=1.0,                 # Devanagari text. hi-IN was forcing Hindi phonetics
-        ),                            # even for English responses.
+            language=Language.EN_IN,
+            temperature=0.6,
+            pace=1.0,
+        ),
     )
 
     # ----- Tools -----
@@ -270,8 +297,16 @@ async def build_pipeline_for_call(
         for name in tenant.tools_enabled
         if name in _ALL_TOOL_SCHEMAS
     ]
+    # Add confirm_payment when payment is enabled for this tenant
+    if tenant.payment_enabled:
+        enabled_schemas.append(_ALL_TOOL_SCHEMAS["confirm_payment"])
+
     tools_schema = ToolsSchema(standard_tools=enabled_schemas)
     logger.info(f"  Tools enabled: {[s._name for s in enabled_schemas]}")
+
+    # Mutable closure state for payment flow.
+    # Uses list-as-cell trick so inner functions can mutate it.
+    pending_payment_info: list[dict] = []
 
     # Tool handlers — closures that capture call_id, tenant, tool_call_log.
     async def handle_check_availability(params: FunctionCallParams) -> None:
@@ -314,18 +349,19 @@ async def build_pipeline_for_call(
         args = dict(params.arguments)
         args.pop("tenant_id", None)
         args.pop("call_id", None)
+        caller_phone = args.get("caller_phone", "")
         payload = {
             "tenant_id": tenant.id,
             "call_id": call_id,
             "slot": args.get("slot"),
             "caller_name": args.get("caller_name"),
-            "caller_phone": args.get("caller_phone"),
+            "caller_phone": caller_phone,
             "notes": args.get("notes"),
         }
         logger.info(
             f"[tool] book_appointment slot={args.get('slot')} "
             f"name={redact_name(args.get('caller_name'))} "
-            f"phone={redact_phone(args.get('caller_phone'))}"
+            f"phone={redact_phone(caller_phone)}"
         )
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(
@@ -337,29 +373,138 @@ async def build_pipeline_for_call(
         logger.info(f"[tool] book_appointment result={result}")
         tool_call_log.append({
             "name": "book_appointment",
-            "args": args,
+            "args": {**args, "caller_phone": redact_phone(caller_phone)},
             "result": result,
             "at": datetime.now(timezone.utc).isoformat(),
         })
+
+        if result.get("payment_required") and result.get("success"):
+            # Check whether this caller is a trusted patient
+            async with httpx.AsyncClient(timeout=5) as client:
+                trusted_r = await client.post(
+                    f"{config.TOOLS_BASE_URL}/tools/check_trusted_caller",
+                    json={"tenant_id": tenant.id, "caller_phone": caller_phone},
+                    headers=_INTERNAL_HEADERS,
+                )
+                is_trusted = trusted_r.json().get("is_trusted", False)
+
+            amount_inr = (result["payment_amount_paise"] or 0) // 100
+
+            # Store payment info so handle_confirm_payment can use it
+            pending_payment_info.clear()
+            pending_payment_info.append({
+                "appointment_id": result["appointment_id"],
+                "amount_inr": amount_inr,
+                "is_trusted": is_trusted,
+                "caller_phone": caller_phone,
+            })
+
+            # Register in global pending dict so /payment-test can show the dialog
+            _pending_payments[call_id] = {
+                "call_id": call_id,
+                "appointment_id": result["appointment_id"],
+                "amount_inr": amount_inr,
+                "is_trusted": is_trusted,
+            }
+
+            result["mock_payment_dialog"] = True
+            result["amount_inr"] = amount_inr
+            result["is_trusted"] = is_trusted
+            result["instruction_for_priya"] = (
+                f"Appointment is on hold pending payment of ₹{amount_inr}. "
+                f"Tell the caller a payment link has been sent via SMS and you are waiting "
+                f"for payment to confirm. Stay on the line. "
+                f"{'Caller is a trusted patient.' if is_trusted else 'Caller is new — flag for staff attention.'}"
+            )
+            logger.info(
+                f"[payment] Pending payment registered call_id={call_id} "
+                f"appointment_id={result['appointment_id']} amount=₹{amount_inr} "
+                f"trusted={is_trusted}"
+            )
+
+        await params.result_callback(result)
+
+    async def handle_confirm_payment(params: FunctionCallParams) -> None:
+        """Called by LLM after the payment dialog result is injected via SYSTEM message."""
+        args = dict(params.arguments)
+        payment_success = bool(args.get("payment_success", False))
+
+        info = pending_payment_info[-1] if pending_payment_info else None
+        if info is None:
+            logger.warning(f"[payment] confirm_payment called with no pending info call_id={call_id}")
+            await params.result_callback({"error": "no pending payment"})
+            return
+
+        appt_id = info["appointment_id"]
+        is_trusted = info["is_trusted"]
+        caller_phone = info.get("caller_phone")
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(
+                f"{config.TOOLS_BASE_URL}/tools/confirm_payment",
+                json={
+                    "appointment_id": appt_id,
+                    "tenant_id": tenant.id,
+                    "payment_success": payment_success,
+                },
+                headers=_INTERNAL_HEADERS,
+            )
+            result = r.json()
+
+        tool_call_log.append({
+            "name": "confirm_payment",
+            "args": {"payment_success": payment_success},
+            "result": result,
+            "at": datetime.now(timezone.utc).isoformat(),
+        })
+
+        # New patients who pay get a handoff so staff can verify and welcome them
+        if payment_success and not is_trusted:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(
+                    f"{config.TOOLS_BASE_URL}/tools/create_handoff_request",
+                    json={
+                        "tenant_id": tenant.id,
+                        "call_id": call_id,
+                        "appointment_id": appt_id,
+                        "reason": "New patient booked appointment — requires staff verification",
+                        "urgency": "normal",
+                        "caller_phone": redact_phone(caller_phone) if caller_phone else None,
+                    },
+                    headers=_INTERNAL_HEADERS,
+                )
+
+        _pending_payments.pop(call_id, None)
+
+        if payment_success:
+            result["message_for_priya"] = (
+                "Payment confirmed! Tell the caller their appointment is confirmed and "
+                "give them the slot time and doctor name. Then end the call."
+            )
+        else:
+            result["message_for_priya"] = (
+                "Payment was not completed. Tell the caller their appointment is on hold "
+                "and they can complete payment via the SMS link anytime before it expires. "
+                "Someone from the clinic will follow up."
+            )
+
         await params.result_callback(result)
 
     if "check_availability" in tenant.tools_enabled:
         llm.register_function("check_availability", handle_check_availability)
     if "book_appointment" in tenant.tools_enabled:
         llm.register_function("book_appointment", handle_book_appointment)
+    if tenant.payment_enabled:
+        llm.register_function("confirm_payment", handle_confirm_payment)
 
     # ----- Conversation context -----
-    # Inject today's date so the LLM can correctly resolve relative terms
-    # like "kal" (tomorrow), "parsho" (day after tomorrow), "next Tuesday", etc.
-    today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")  # e.g. "Tuesday, 26 May 2026"
+    today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
     system_with_date = tenant.system_prompt + f"\n\nToday is {today} (IST)."
     context = LLMContext(
         messages=[{"role": "system", "content": system_with_date}],
         tools=tools_schema,
     )
 
-    # vad_analyzer enables fast barge-in: VADUserTurnStartStrategy fires after
-    # start_secs=0.1 (100ms) of detected speech, interrupting Priya immediately.
     context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
@@ -374,7 +519,6 @@ async def build_pipeline_for_call(
         ),
     )
 
-    # ----- Pipeline -----
     pipeline = Pipeline([
         transport.input(),
         stt,
@@ -398,11 +542,10 @@ async def build_pipeline_for_call(
 
 
 # ============================================================================
-# Async post-call summary (fire-and-forget — does not block disconnect).
+# Async post-call summary (fire-and-forget)
 # ============================================================================
 
 def _build_summary_prompt(messages: list[dict]) -> str:
-    """Construct a prompt that treats the transcript as DATA, not instructions."""
     transcript_text = "\n".join(
         f"{msg['role']}: {msg['content']}"
         for msg in messages
@@ -428,7 +571,6 @@ Summary (one sentence only):"""
 
 
 async def _generate_and_store_summary(pool: asyncpg.Pool, call_id: str, messages: list[dict]) -> None:
-    """Generate a one-line call summary with Gemini and UPDATE call_logs."""
     if not (config.GEMINI_MODEL and config.GOOGLE_API_KEY):
         return
     try:
@@ -452,16 +594,14 @@ async def _generate_and_store_summary(pool: asyncpg.Pool, call_id: str, messages
 
 
 # ============================================================================
-# Per-call watchdog — forces pipeline termination after MAX_CALL_DURATION_SECS.
+# Per-call watchdog
 # ============================================================================
 
 async def _force_terminate_after_timeout(task: PipelineTask, call_id: str, duration: int) -> None:
-    """Force-end a call that exceeds the maximum allowed duration."""
     try:
         await asyncio.sleep(duration)
         logger.warning(
-            f"TIMEOUT: call {call_id} exceeded {duration}s — forcing termination. "
-            f"Possible attack or stuck pipeline."
+            f"TIMEOUT: call {call_id} exceeded {duration}s — forcing termination."
         )
         try:
             await task.queue_frame(TTSSpeakFrame(
@@ -472,20 +612,196 @@ async def _force_terminate_after_timeout(task: PipelineTask, call_id: str, durat
             pass
         await task.queue_frame(EndFrame())
     except asyncio.CancelledError:
-        pass  # Normal disconnect cancelled this watchdog — exit quietly.
+        pass
 
 
 # ============================================================================
-# Per-call entry point — called by Pipecat's runner when a client connects.
+# Payment API route handlers (mounted in __main__ onto pipecat's FastAPI app)
+# ============================================================================
+
+def _check_payment_auth(request) -> bool:
+    """Same Basic Auth check as admin — reuses ADMIN_TOKEN."""
+    if not config.ADMIN_TOKEN:
+        return False
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth[6:]).decode("utf-8")
+        _, _, password = decoded.partition(":")
+        return secrets.compare_digest(password, config.ADMIN_TOKEN)
+    except Exception:
+        return False
+
+
+async def get_pending_payments(request):
+    from fastapi.responses import JSONResponse, Response
+    if not _check_payment_auth(request):
+        return Response(
+            "Unauthorized", status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="Voice Agent Admin"'},
+        )
+    return JSONResponse(list(_pending_payments.values()))
+
+
+async def confirm_payment_result(request):
+    from fastapi.responses import JSONResponse, Response
+    if not _check_payment_auth(request):
+        return Response(
+            "Unauthorized", status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="Voice Agent Admin"'},
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    call_id = body.get("call_id", "")
+    payment_success = bool(body.get("payment_success", False))
+
+    task = _active_tasks.get(call_id)
+    if not task:
+        return JSONResponse({"error": "no active call for that call_id"}, status_code=404)
+
+    # Inject result as a user message directly into the LLM context.
+    # run_llm=True makes the aggregator immediately send the updated context to the LLM.
+    if payment_success:
+        msg = "SYSTEM: Payment confirmed. Immediately call the confirm_payment tool with payment_success=true."
+    else:
+        msg = "SYSTEM: Payment failed or was declined. Immediately call the confirm_payment tool with payment_success=false."
+
+    await task.queue_frame(
+        LLMMessagesAppendFrame(
+            messages=[{"role": "user", "content": msg}],
+            run_llm=True,
+        )
+    )
+    logger.info(f"[payment] Dialog result injected: call_id={call_id} success={payment_success}")
+    return JSONResponse({"ok": True})
+
+
+async def payment_test_page(request):
+    from fastapi.responses import HTMLResponse, Response
+    if not _check_payment_auth(request):
+        return Response(
+            "Unauthorized", status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="Voice Agent Admin"'},
+        )
+    # Embed token in page so JS can use it for API calls without re-prompting
+    token = config.ADMIN_TOKEN
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Payment Mock — Voice Agent</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 min-h-screen font-sans">
+<div class="max-w-xl mx-auto px-4 py-10">
+  <div class="mb-6">
+    <h1 class="text-2xl font-bold text-gray-900">Mock Payment Console</h1>
+    <p class="text-sm text-gray-500 mt-1">Polls every 2s. Approve or decline pending payments.</p>
+  </div>
+  <div id="status" class="text-sm text-gray-400 mb-4">Waiting for pending payments...</div>
+  <div id="cards" class="space-y-4"></div>
+</div>
+
+<script>
+const TOKEN = {json.dumps(token)};
+const AUTH = 'Basic ' + btoa('admin:' + TOKEN);
+
+async function fetchPending() {{
+  try {{
+    const r = await fetch('/payment/pending', {{headers: {{Authorization: AUTH}}}});
+    if (!r.ok) return [];
+    return await r.json();
+  }} catch (e) {{ return []; }}
+}}
+
+async function sendResult(callId, success) {{
+  const btn = document.getElementById('btn-' + callId + '-' + (success ? 'yes' : 'no'));
+  if (btn) btn.disabled = true;
+  try {{
+    await fetch('/payment/confirm', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json', Authorization: AUTH}},
+      body: JSON.stringify({{call_id: callId, payment_success: success}})
+    }});
+  }} catch (e) {{ console.error(e); }}
+}}
+
+function renderCards(payments) {{
+  const container = document.getElementById('cards');
+  const status = document.getElementById('status');
+
+  if (!payments.length) {{
+    status.textContent = 'No pending payments. Polling...';
+    container.innerHTML = '';
+    return;
+  }}
+
+  status.textContent = payments.length + ' pending payment(s)';
+
+  const existing = new Set([...container.querySelectorAll('[data-call-id]')].map(el => el.dataset.callId));
+  const incoming = new Set(payments.map(p => p.call_id));
+
+  // Remove cards no longer pending
+  existing.forEach(id => {{
+    if (!incoming.has(id)) document.querySelector('[data-call-id="' + id + '"]')?.remove();
+  }});
+
+  // Add new cards
+  payments.forEach(p => {{
+    if (existing.has(p.call_id)) return;
+    const div = document.createElement('div');
+    div.dataset.callId = p.call_id;
+    div.className = 'bg-white rounded-xl shadow p-6';
+    div.innerHTML = `
+      <div class="text-4xl mb-3 text-center">💳</div>
+      <h2 class="text-lg font-semibold text-center text-gray-900 mb-1">Mock Payment</h2>
+      <p class="text-center text-gray-600 mb-1">Amount: <strong>₹${{p.amount_inr}}</strong></p>
+      <p class="text-center text-xs text-gray-400 mb-4">
+        Call: ${{p.call_id.slice(0,8)}}...
+        ${{p.is_trusted ? '· <span class="text-green-600 font-medium">Trusted caller</span>' : '· <span class="text-yellow-600 font-medium">New caller</span>'}}
+      </p>
+      <div class="flex gap-3 justify-center">
+        <button id="btn-${{p.call_id}}-yes"
+          onclick="sendResult('${{p.call_id}}', true)"
+          class="bg-green-600 hover:bg-green-700 text-white font-semibold px-6 py-2 rounded-lg">
+          ✓ Yes, Paid
+        </button>
+        <button id="btn-${{p.call_id}}-no"
+          onclick="sendResult('${{p.call_id}}', false)"
+          class="bg-red-600 hover:bg-red-700 text-white font-semibold px-6 py-2 rounded-lg">
+          ✗ No, Failed
+        </button>
+      </div>`;
+    container.appendChild(div);
+  }});
+}}
+
+async function poll() {{
+  const payments = await fetchPending();
+  renderCards(payments);
+}}
+
+setInterval(poll, 2000);
+poll();
+</script>
+</body>
+</html>"""
+    return HTMLResponse(html)
+
+
+# ============================================================================
+# Per-call entry point
 # ============================================================================
 
 async def bot(runner_args: RunnerArguments):
     """Entrypoint: called once per WebRTC connection (or per phone call in Stage 3)."""
     global _active_calls
 
-    # ---- Concurrency gate (cost protection) ----
-    # In asyncio there's no await between the check and the acquire, so this is
-    # race-free — another coroutine can only preempt at an 'await' point.
     if _concurrency_semaphore._value <= 0:
         logger.warning(
             f"REJECTED: connection refused, {_active_calls} calls already active "
@@ -521,13 +837,13 @@ async def bot(runner_args: RunnerArguments):
 
         task, context = await build_pipeline_for_call(transport, tenant, call_id, tool_call_log)
 
-        # Filler phrase while tool is executing — fires the moment Gemini emits a tool call,
-        # before the HTTP round-trip to the tools server completes.
+        # Register task so payment dialog can inject frames into this call
+        _active_tasks[call_id] = task
+
         @task.event_handler("on_function_calls_started")
         async def on_tool_started(service, function_calls):
             await task.queue_frame(TTSSpeakFrame("जी, एक second..."))
 
-        # ---- Per-call timeout watchdog (cost protection) ----
         timeout_task = asyncio.create_task(
             _force_terminate_after_timeout(task, call_id, config.MAX_CALL_DURATION_SECS)
         )
@@ -538,7 +854,6 @@ async def bot(runner_args: RunnerArguments):
             started_at = datetime.now(timezone.utc)
             logger.info(f"Client connected. call_id={call_id}  greeting={tenant.greeting!r}")
 
-            # Create the call_log row now so appointments can FK-reference call_id during the call.
             await pool.execute(
                 """
                 INSERT INTO call_logs (tenant_id, call_id, started_at, tool_calls, metadata)
@@ -555,20 +870,19 @@ async def bot(runner_args: RunnerArguments):
 
         @transport.event_handler("on_client_disconnected")
         async def on_disconnected(transport, client):
-            # Cancel the watchdog on normal disconnect so it doesn't fire after hangup.
             if not timeout_task.done():
                 timeout_task.cancel()
+
+            # Clean up payment state for this call
+            _active_tasks.pop(call_id, None)
+            _pending_payments.pop(call_id, None)
 
             ended_at = datetime.now(timezone.utc)
             duration_secs = int((ended_at - started_at).total_seconds()) if started_at else 0
             logger.info(f"Client disconnected. call_id={call_id}  duration={duration_secs}s")
 
-            # context.messages is a mix of plain dicts (user/assistant text) and
-            # LLMSpecificMessage objects (tool calls, function responses). Only plain
-            # dicts are serializable and relevant for the transcript.
             plain_messages = [m for m in context.messages if isinstance(m, dict)]
 
-            # Determine call outcome from tool_call_log
             booked = any(
                 t["name"] == "book_appointment" and t.get("result", {}).get("success")
                 for t in tool_call_log
@@ -583,10 +897,8 @@ async def bot(runner_args: RunnerArguments):
 
             logger.info(f"  outcome={outcome}  turns={turn_count}  tool_calls={len(tool_call_log)}")
 
-            # Mirror full turn history to Redis (simple: write once at end of call)
             await append_turns_bulk(call_id, plain_messages)
 
-            # Persist transcript + outcome to call_logs
             await pool.execute(
                 """
                 UPDATE call_logs SET
@@ -605,7 +917,6 @@ async def bot(runner_args: RunnerArguments):
                 call_id,
             )
 
-            # Async summary — don't block disconnect
             asyncio.create_task(_generate_and_store_summary(pool, call_id, plain_messages))
 
             await task.cancel()
@@ -614,6 +925,8 @@ async def bot(runner_args: RunnerArguments):
         await runner.run(task)
 
     finally:
+        _active_tasks.pop(call_id, None)
+        _pending_payments.pop(call_id, None)
         _concurrency_semaphore.release()
         _active_calls -= 1
         logger.info(f"Call ended. Active: {_active_calls}/{config.MAX_CONCURRENT_CALLS}")
@@ -626,9 +939,6 @@ async def bot(runner_args: RunnerArguments):
 if __name__ == "__main__":
     import os as _os
 
-    # STUN patch — injects Google STUN into the WebRTC handler so the server
-    # emits server-reflexive candidates instead of only Docker-internal ones.
-    # Harmless when running --transport exotel (the patched class is never used).
     import pipecat.transports.smallwebrtc.request_handler as _rh
     from pipecat.transports.smallwebrtc.connection import IceServer as _IceServer
     _OrigHandler = _rh.SmallWebRTCRequestHandler
@@ -641,17 +951,19 @@ if __name__ == "__main__":
 
     _rh.SmallWebRTCRequestHandler = _STUNRequestHandler
 
-    # If PIPECAT_PROXY env var is set (production), inject --proxy into argv so
-    # pipecat's runner includes it in Exotel WebSocket URL responses.
     _proxy = _os.environ.get("PIPECAT_PROXY", "").strip()
     if _proxy and "--proxy" not in sys.argv:
         sys.argv.extend(["--proxy", _proxy])
 
-    # Mount the admin dashboard onto pipecat's FastAPI app before the runner
-    # starts the server. Routes: GET /admin, POST /admin/appointments, etc.
     from pipecat.runner.run import app as _pipecat_app
     from app.admin import router as _admin_router
     _pipecat_app.include_router(_admin_router)
+
+    # Mount payment dialog routes on the same app/port as admin and agent.
+    # Option C: separate page — avoids modifying the compiled prebuilt UI.
+    _pipecat_app.add_api_route("/payment/pending", get_pending_payments, methods=["GET"])
+    _pipecat_app.add_api_route("/payment/confirm", confirm_payment_result, methods=["POST"])
+    _pipecat_app.add_api_route("/payment-test", payment_test_page, methods=["GET"])
 
     from pipecat.runner.run import main
     main()

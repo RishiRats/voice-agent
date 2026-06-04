@@ -38,11 +38,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 async def require_internal_token(
     x_internal_token: Annotated[str | None, Header()] = None,
 ) -> None:
-    """Constant-time comparison against the shared secret.
-
-    Uses secrets.compare_digest to avoid timing side-channels — an attacker
-    measuring response latency gets no signal about how many bytes matched.
-    """
+    """Constant-time comparison against the shared secret."""
     if x_internal_token is None:
         raise HTTPException(status_code=401, detail="Missing X-Internal-Token")
     if not secrets.compare_digest(x_internal_token, config.TOOLS_INTERNAL_TOKEN):
@@ -95,17 +91,13 @@ TIME_RANGES = {
     "any":       (time(10, 0), time(20, 0)),
 }
 
-# Day-of-week index (Monday=0) → canonical abbreviated name
 _DOW_MAP = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 
 def _is_open(business_hours: dict, requested_date: date) -> bool:
-    """Return True if the tenant is open on requested_date."""
-    dow = _DOW_MAP[requested_date.weekday()]  # e.g. "sun"
-    # Check explicit single-day key first
+    dow = _DOW_MAP[requested_date.weekday()]
     if dow in business_hours:
         return business_hours[dow] != "closed"
-    # Check range keys like "mon-sat"
     for key, value in business_hours.items():
         if "-" in key:
             start_day, end_day = key.split("-", 1)
@@ -119,7 +111,6 @@ def _is_open(business_hours: dict, requested_date: date) -> bool:
 
 
 def _generate_slots(range_start: time, range_end: time) -> list[time]:
-    """30-minute slots within [range_start, range_end)."""
     slots = []
     current = datetime.combine(date.today(), range_start)
     end = datetime.combine(date.today(), range_end)
@@ -179,7 +170,6 @@ async def check_availability(request: Request, req: CheckAvailabilityRequest):
     range_start, range_end = TIME_RANGES[req.time_range]
     all_slots = _generate_slots(range_start, range_end)
 
-    # Fetch already-booked slots for this tenant + date
     booked_rows = await pool.fetch(
         """
         SELECT slot_at FROM appointments
@@ -210,7 +200,7 @@ async def check_availability(request: Request, req: CheckAvailabilityRequest):
 
 class BookAppointmentRequest(BaseModel):
     tenant_id: int
-    call_id: str | None = None  # NULL until call_log row exists; FK is nullable
+    call_id: str | None = None
     slot: str  # ISO datetime e.g. "2026-05-28T11:30:00"
     caller_name: str
     caller_phone: str
@@ -231,6 +221,8 @@ class BookAppointmentResponse(BaseModel):
     appointment_id: int | None = None
     confirmed_slot: str | None = None
     reason: str | None = None
+    payment_required: bool = False
+    payment_amount_paise: int | None = None
 
 
 @app.post("/tools/book_appointment", response_model=BookAppointmentResponse,
@@ -239,6 +231,16 @@ class BookAppointmentResponse(BaseModel):
 async def book_appointment(request: Request, req: BookAppointmentRequest):
     slot_dt = datetime.fromisoformat(req.slot)
     pool = await get_pg_pool()
+
+    # Fetch tenant payment config alongside the booking
+    tenant_row = await pool.fetchrow(
+        "SELECT payment_enabled, payment_amount_paise, payment_expiry_hours FROM tenants WHERE id = $1",
+        req.tenant_id,
+    )
+    if not tenant_row:
+        raise HTTPException(status_code=404, detail="tenant not found")
+
+    payment_enabled = tenant_row["payment_enabled"]
 
     try:
         async with pool.acquire() as conn:
@@ -255,10 +257,24 @@ async def book_appointment(request: Request, req: BookAppointmentRequest):
                 if existing is not None:
                     return BookAppointmentResponse(success=False, reason="slot_taken")
 
+                if payment_enabled:
+                    initial_status = "pending"
+                    payment_status = "pending"
+                    payment_expires_at = datetime.utcnow() + timedelta(
+                        hours=tenant_row["payment_expiry_hours"]
+                    )
+                else:
+                    initial_status = "booked"
+                    payment_status = "not_required"
+                    payment_expires_at = None
+
                 row = await conn.fetchrow(
                     """
-                    INSERT INTO appointments (tenant_id, call_id, caller_name, caller_phone, slot_at, notes, status)
-                    VALUES ($1, $2, $3, $4, $5, $6, 'booked')
+                    INSERT INTO appointments
+                      (tenant_id, call_id, caller_name, caller_phone,
+                       slot_at, notes, status,
+                       payment_status, payment_expires_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                     RETURNING id, slot_at
                     """,
                     req.tenant_id,
@@ -267,21 +283,156 @@ async def book_appointment(request: Request, req: BookAppointmentRequest):
                     req.caller_phone,
                     slot_dt,
                     req.notes,
+                    initial_status,
+                    payment_status,
+                    payment_expires_at,
                 )
     except asyncpg.exceptions.UniqueViolationError:
         return BookAppointmentResponse(success=False, reason="slot_taken")
 
     logger.info(
-        f"BOOKED: id={row['id']} tenant={req.tenant_id} "
+        f"APPOINTMENT: id={row['id']} tenant={req.tenant_id} "
         f"name={redact_name(req.caller_name)} phone={redact_phone(req.caller_phone)} "
-        f"slot={row['slot_at'].isoformat()}"
+        f"slot={row['slot_at'].isoformat()} status={initial_status} payment={payment_status}"
     )
 
     return BookAppointmentResponse(
         success=True,
         appointment_id=row["id"],
         confirmed_slot=row["slot_at"].isoformat(),
+        payment_required=payment_enabled,
+        payment_amount_paise=tenant_row["payment_amount_paise"],
     )
+
+
+# ---------------------------------------------------------------------------
+# /tools/check_trusted_caller
+# ---------------------------------------------------------------------------
+
+class CheckTrustedRequest(BaseModel):
+    tenant_id: int
+    caller_phone: str
+
+
+class CheckTrustedResponse(BaseModel):
+    is_trusted: bool
+
+
+@app.post("/tools/check_trusted_caller", response_model=CheckTrustedResponse,
+          dependencies=[Depends(require_internal_token)])
+@limiter.limit("60/minute")
+async def check_trusted_caller(request: Request, body: CheckTrustedRequest):
+    pool = await get_pg_pool()
+    row = await pool.fetchval(
+        "SELECT id FROM trusted_callers WHERE tenant_id = $1 AND phone = $2",
+        body.tenant_id,
+        body.caller_phone,
+    )
+    return CheckTrustedResponse(is_trusted=row is not None)
+
+
+# ---------------------------------------------------------------------------
+# /tools/confirm_payment
+# ---------------------------------------------------------------------------
+
+class ConfirmPaymentRequest(BaseModel):
+    appointment_id: int
+    tenant_id: int
+    payment_success: bool
+
+
+class ConfirmPaymentResponse(BaseModel):
+    appointment_status: str
+    payment_status: str
+
+
+@app.post("/tools/confirm_payment", response_model=ConfirmPaymentResponse,
+          dependencies=[Depends(require_internal_token)])
+@limiter.limit("30/minute")
+async def confirm_payment(request: Request, body: ConfirmPaymentRequest):
+    pool = await get_pg_pool()
+    if body.payment_success:
+        await pool.execute(
+            """
+            UPDATE appointments
+            SET status = 'booked',
+                payment_status = 'paid',
+                payment_completed_at = NOW()
+            WHERE id = $1 AND tenant_id = $2
+            """,
+            body.appointment_id,
+            body.tenant_id,
+        )
+        logger.info(
+            f"Payment confirmed: appointment_id={body.appointment_id} tenant={body.tenant_id}"
+        )
+        return ConfirmPaymentResponse(appointment_status="booked", payment_status="paid")
+    else:
+        logger.info(
+            f"Payment failed: appointment_id={body.appointment_id} tenant={body.tenant_id}"
+        )
+        return ConfirmPaymentResponse(appointment_status="pending", payment_status="failed")
+
+
+# ---------------------------------------------------------------------------
+# /tools/create_handoff_request
+# ---------------------------------------------------------------------------
+
+class HandoffRequestBody(BaseModel):
+    tenant_id: int
+    call_id: str
+    appointment_id: int | None = None
+    reason: str
+    urgency: str = "normal"
+    caller_phone: str | None = None
+
+
+@app.post("/tools/create_handoff_request",
+          dependencies=[Depends(require_internal_token)])
+@limiter.limit("30/minute")
+async def create_handoff_request(request: Request, body: HandoffRequestBody):
+    pool = await get_pg_pool()
+    await pool.execute(
+        """
+        INSERT INTO handoff_requests
+          (tenant_id, call_id, appointment_id, reason, urgency, caller_phone)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        """,
+        body.tenant_id,
+        body.call_id,
+        body.appointment_id,
+        body.reason,
+        body.urgency,
+        body.caller_phone,
+    )
+    logger.info(
+        f"Handoff created: tenant={body.tenant_id} reason={body.reason!r} urgency={body.urgency}"
+    )
+    return {"created": True}
+
+
+# ---------------------------------------------------------------------------
+# /tools/cancel_expired_payments  — called by the retention job
+# ---------------------------------------------------------------------------
+
+@app.post("/tools/cancel_expired_payments",
+          dependencies=[Depends(require_internal_token)])
+async def cancel_expired_payments(request: Request):
+    pool = await get_pg_pool()
+    result = await pool.fetch(
+        """
+        UPDATE appointments
+        SET status = 'cancelled',
+            payment_status = 'expired'
+        WHERE payment_status = 'pending'
+          AND payment_expires_at < NOW()
+          AND status != 'cancelled'
+        RETURNING id, tenant_id
+        """
+    )
+    cancelled = [{"id": r["id"], "tenant_id": r["tenant_id"]} for r in result]
+    logger.info(f"Auto-cancelled {len(cancelled)} expired pending appointments")
+    return {"cancelled_count": len(cancelled), "cancelled": cancelled}
 
 
 # ---------------------------------------------------------------------------

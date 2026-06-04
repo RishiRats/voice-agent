@@ -31,6 +31,11 @@ class Tenant:
     tools_enabled: list[str]
     business_hours: dict
     metadata: dict
+    payment_enabled: bool
+    payment_amount_paise: Optional[int]
+    payment_expiry_hours: int
+    razorpay_key_id: Optional[str]
+    razorpay_key_secret: Optional[str]
 
 
 async def load_tenant_by_id(pool: asyncpg.Pool, tenant_id: int) -> Tenant:
@@ -39,7 +44,9 @@ async def load_tenant_by_id(pool: asyncpg.Pool, tenant_id: int) -> Tenant:
         """
         SELECT id, name, inbound_did, system_prompt, greeting, voice,
                default_language, llm_model, temperature, tools_enabled,
-               business_hours, metadata
+               business_hours, metadata,
+               payment_enabled, payment_amount_paise, payment_expiry_hours,
+               razorpay_key_id, razorpay_key_secret
         FROM tenants
         WHERE id = $1
         """,
@@ -56,7 +63,9 @@ async def load_tenant_by_did(pool: asyncpg.Pool, did: str) -> Tenant:
         """
         SELECT id, name, inbound_did, system_prompt, greeting, voice,
                default_language, llm_model, temperature, tools_enabled,
-               business_hours, metadata
+               business_hours, metadata,
+               payment_enabled, payment_amount_paise, payment_expiry_hours,
+               razorpay_key_id, razorpay_key_secret
         FROM tenants
         WHERE inbound_did = $1
         """,
@@ -81,6 +90,11 @@ def _row_to_tenant(row: asyncpg.Record) -> Tenant:
         tools_enabled=list(_j(row["tools_enabled"])),
         business_hours=dict(_j(row["business_hours"])),
         metadata=dict(_j(row["metadata"])),
+        payment_enabled=bool(row["payment_enabled"]),
+        payment_amount_paise=row["payment_amount_paise"],
+        payment_expiry_hours=int(row["payment_expiry_hours"]),
+        razorpay_key_id=row["razorpay_key_id"],
+        razorpay_key_secret=row["razorpay_key_secret"],
     )
 
 

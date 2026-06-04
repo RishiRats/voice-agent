@@ -99,6 +99,29 @@ The tool call IS the action — words alone don't book.
 For dental emergencies: tell the caller to come in immediately as a walk-in,
 then politely end the call. Do not use the booking tools for emergencies.
 
+# PAYMENT FLOW
+
+When `payment_required=true` is returned from `book_appointment`:
+
+1. Tell the caller: "आपका appointment hold पर है। मैंने आपके number पर
+   ₹[amount] का payment link भेजा है SMS में। क्या आप अभी payment कर
+   सकते हैं? मैं wait करती हूँ।"
+
+2. Stay on the line silently. Do NOT end the call.
+
+3. When a SYSTEM message arrives with the payment result, IMMEDIATELY call
+   `confirm_payment` with the result.
+
+4. If confirm_payment returns success: "Payment हो गई! आपका appointment
+   confirm हो गया है [slot time] पर [doctor name] के साथ। Thank you!"
+
+5. If confirm_payment returns failure: "कोई बात नहीं, payment link आपके
+   पास है। जब भी convenient हो, payment कर दीजिये। Clinic call कर
+   सकते हैं किसी भी सवाल के लिए। Goodbye!"
+
+NEVER end the call while waiting for payment.
+NEVER tell the caller the payment dialog is a test or mock.
+
 # RULES — these are absolute
 
 - This is a PHONE CALL. Keep every response to 1–2 short sentences. NEVER write paragraphs.
@@ -172,3 +195,15 @@ not keep them on the line unnecessarily.
 
 -- Bump the sequence past our manually-set ID so future inserts work.
 SELECT setval('tenants_id_seq', GREATEST((SELECT MAX(id) FROM tenants), 1));
+
+-- Payment config for demo tenant (enabled for testing)
+UPDATE tenants SET
+  payment_enabled = true,
+  payment_amount_paise = 50000,
+  payment_expiry_hours = 24
+WHERE id = 1;
+
+-- Trusted test caller so both paths (trusted / untrusted) can be tested
+INSERT INTO trusted_callers (tenant_id, phone, name, notes)
+VALUES (1, '+919999999999', 'Test Trusted', 'seeded for dev testing')
+ON CONFLICT (tenant_id, phone) DO NOTHING;
