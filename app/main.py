@@ -524,7 +524,7 @@ async def build_pipeline_for_call(
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
                     start_secs=0.1,
-                    stop_secs=0.4,
+                    stop_secs=0.2,
                     confidence=0.6,
                     min_volume=0.4,
                 )
