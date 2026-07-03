@@ -295,7 +295,7 @@ async def build_pipeline_for_call(
             voice=tenant.voice,
             language=Language.EN_IN,
             temperature=0.6,
-            pace=1.0,
+            pace=1.2,
         ),
     )
 
