@@ -160,6 +160,7 @@ not keep them on the line unnecessarily.
         "insurance_accepted": ["VHI Healthcare", "Laya Healthcare", "Irish Life Health", "Aviva Health"]
     }'::jsonb
 ) ON CONFLICT (id) DO UPDATE SET
+    name = EXCLUDED.name,
     system_prompt = EXCLUDED.system_prompt,
     greeting = EXCLUDED.greeting,
     voice = EXCLUDED.voice,
