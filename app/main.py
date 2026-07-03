@@ -858,7 +858,7 @@ async def bot(runner_args: RunnerArguments):
 
         @task.event_handler("on_function_calls_started")
         async def on_tool_started(service, function_calls):
-            await task.queue_frame(TTSSpeakFrame("जी, एक second..."))
+            await task.queue_frame(TTSSpeakFrame("One moment please..."))
 
         timeout_task = asyncio.create_task(
             _force_terminate_after_timeout(task, call_id, config.MAX_CALL_DURATION_SECS)

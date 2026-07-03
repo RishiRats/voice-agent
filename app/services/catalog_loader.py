@@ -31,8 +31,8 @@ class CatalogItem:
         min_inr = self.price_min_paise // 100
         max_inr = self.price_max_paise // 100 if self.price_max_paise is not None else None
         if max_inr is not None and max_inr != min_inr:
-            return f"₹{min_inr:,}–₹{max_inr:,}"
-        return f"₹{min_inr:,}"
+            return f"€{min_inr:,}–€{max_inr:,}"
+        return f"€{min_inr:,}"
 
     def duration_display(self) -> str:
         if self.duration_mins < 60:
