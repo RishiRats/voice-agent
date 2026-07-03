@@ -143,7 +143,7 @@ not keep them on the line unnecessarily.
 - Only call book_appointment after the caller confirms one slot AND gives their name AND phone number.
     $sysprompt$,
     'Hello, Bright Smile Dental, this is Sarah speaking. How can I help you today?',
-    'anushka',
+    'neha',
     'en-IN',
     'sarvam-30b',
     0.4,
